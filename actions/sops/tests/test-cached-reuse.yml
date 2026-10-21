@@ -1,0 +1,39 @@
+name: Test cached reuse
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: first
+        uses: .
+        with:
+          version: v3.9.1
+      - name: Record binary mtime
+        run: |
+          P="$(command -v sops)"
+          echo "path: $P"
+          stat -c %Y "$P" > /tmp/sops-mtime
+          cat /tmp/sops-mtime
+      - id: second
+        uses: .
+        with:
+          version: v3.9.1
+      - name: Assert cached binary reused and works
+        run: |
+          P="$(command -v sops)"
+          BEFORE="$(cat /tmp/sops-mtime)"
+          AFTER="$(stat -c %Y "$P")"
+          echo "before: $BEFORE after: $AFTER"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "FAIL: binary was re-downloaded"
+            exit 1
+          fi
+          OUT="$(sops --version 2>&1 || true)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "3\.9\.1"; then
+            echo "FAIL: expected sops 3.9.1"
+            exit 1
+          fi
+          echo "PASS"

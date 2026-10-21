@@ -1,0 +1,308 @@
+/*
+Copyright 2020 The Kubernetes Authors.
+Copyright 2021 The Flux authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+This file is modified from the source at
+https://github.com/kubernetes-sigs/cluster-api/blob/aa049f15e75d3ac715c2a1a1e58d34fa77280eef/internal/envtest/environment.go,
+and initially adapted to provide test environment utilities for any
+controller while staying in control over the runtime scheme and CRD
+setup.
+*/
+
+package testenv
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/klogr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/config"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+)
+
+var (
+	env *envtest.Environment
+)
+
+var (
+	cacheSyncBackoff = wait.Backoff{
+		Duration: 100 * time.Millisecond,
+		Factor:   1.5,
+		Steps:    8,
+		Jitter:   0.4,
+	}
+
+	errAlreadyStarted = errors.New("environment has already been started")
+	errAlreadyStopped = errors.New("environment has already been stopped")
+)
+
+// Environment encapsulates a Kubernetes local test environment.
+type Environment struct {
+	manager.Manager
+	client.Client
+	Config *rest.Config
+
+	env           *envtest.Environment
+	startOnce     sync.Once
+	stopOnce      sync.Once
+	cancelManager context.CancelFunc
+}
+
+// options holds the configuration options for the Environment.
+type options struct {
+	scheme                  *runtime.Scheme
+	crdDirectoryPaths       []string
+	maxConcurrentReconciles int
+}
+
+// withDefaults sets the default configuration for missing values.
+func (o *options) withDefaults() {
+	if o.scheme == nil {
+		o.scheme = scheme.Scheme
+	}
+	if o.maxConcurrentReconciles == 0 {
+		o.maxConcurrentReconciles = 2
+	}
+}
+
+// Option sets a configuration for the Environment.
+type Option func(*options)
+
+// WithScheme configures the runtime.Scheme for the Environment.
+// If no scheme is configured, the Environment defaults to the global runtime.Scheme.
+func WithScheme(scheme *runtime.Scheme) Option {
+	return func(o *options) {
+		o.scheme = scheme
+	}
+}
+
+// WithCRDPath configures the paths the envtest.Environment should look at for Custom Resource Definitions.
+func WithCRDPath(path ...string) Option {
+	return func(o *options) {
+		o.crdDirectoryPaths = append(o.crdDirectoryPaths, path...)
+	}
+}
+
+// WithMaxConcurrentReconciles configures the maximum number of concurrent Reconciles which can be run.
+func WithMaxConcurrentReconciles(max int) Option {
+	return func(o *options) {
+		o.maxConcurrentReconciles = max
+	}
+}
+
+// New creates a new environment spinning up a local api-server.
+//
+// NOTE: This function should be called only once for each package you are running tests within, usually the environment
+// is initialised in a suite_test.go or <package>_test.go file within a `TestMain` function.
+//
+// When a testenv Environment is created, it initializes the
+// controller-runtime's deferred logger with a default logger based on klog. In
+// order to override this behavior, the controller-runtime logger can be
+// initialized before creating testenv Environment.
+//
+//	import (
+//	    "testing"
+//
+//	    "github.com/fluxcd/pkg/runtime/testenv"
+//	    ctrl "sigs.k8s.io/controller-runtime"
+//	    "sigs.k8s.io/controller-runtime/pkg/log/zap"
+//	}
+//
+//	func TestMain(m *testing.M) {
+//	    zlog := zap.New(zap.UseDevMode(true))
+//	    ctrl.SetLogger(zlog)
+//
+//	    testEnv = testenv.New()
+//	    ...
+//	}
+func New(o ...Option) *Environment {
+	// Set a default logger if not set already.
+	log.SetLogger(klogr.New())
+
+	opts := options{}
+	for _, apply := range o {
+		apply(&opts)
+	}
+	opts.withDefaults()
+
+	env = &envtest.Environment{
+		ErrorIfCRDPathMissing: true,
+		CRDDirectoryPaths:     opts.crdDirectoryPaths,
+	}
+
+	if _, err := env.Start(); err != nil {
+		err = kerrors.NewAggregate([]error{err, env.Stop()})
+		panic(err)
+	}
+
+	mgr, err := ctrl.NewManager(env.Config, manager.Options{
+		Scheme: opts.scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+		Controller: config.Controller{
+			MaxConcurrentReconciles: opts.maxConcurrentReconciles,
+		},
+	})
+	if err != nil {
+		klog.Fatalf("Failed to start testenv manager: %v", err)
+	}
+
+	return &Environment{
+		Manager: mgr,
+		Client:  mgr.GetClient(),
+		Config:  mgr.GetConfig(),
+		env:     env,
+	}
+}
+
+// Start starts the test environment.
+func (e *Environment) Start(ctx context.Context) error {
+	err := errAlreadyStarted
+	e.startOnce.Do(func() {
+		ctx, cancel := context.WithCancel(ctx)
+		e.cancelManager = cancel
+		err = e.Manager.Start(ctx)
+	})
+	return err
+}
+
+// Stop stops the test environment.
+func (e *Environment) Stop() error {
+	err := errAlreadyStopped
+	e.stopOnce.Do(func() {
+		e.cancelManager()
+		err = e.env.Stop()
+	})
+	return err
+}
+
+// Cleanup deletes all the given objects.
+func (e *Environment) Cleanup(ctx context.Context, objs ...client.Object) error {
+	errs := []error{}
+	for _, o := range objs {
+		err := e.Client.Delete(ctx, o)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		errs = append(errs, err)
+	}
+	return kerrors.NewAggregate(errs)
+}
+
+// CleanupAndWait deletes all the given objects and waits for the cache to be updated accordingly.
+//
+// NOTE: Waiting for the cache to be updated helps in preventing test flakes due to the cache sync delays.
+func (e *Environment) CleanupAndWait(ctx context.Context, objs ...client.Object) error {
+	if err := e.Cleanup(ctx, objs...); err != nil {
+		return err
+	}
+
+	// Makes sure the cache is updated with the deleted object
+	errs := []error{}
+	for _, o := range objs {
+		// Ignoring namespaces because in testenv the namespace cleaner is not running.
+		if o.GetObjectKind().GroupVersionKind().GroupKind() == corev1.SchemeGroupVersion.WithKind("Namespace").GroupKind() {
+			continue
+		}
+
+		oCopy := o.DeepCopyObject().(client.Object)
+		key := client.ObjectKeyFromObject(o)
+		err := wait.ExponentialBackoff(
+			cacheSyncBackoff,
+			func() (done bool, err error) {
+				if err := e.Get(ctx, key, oCopy); err != nil {
+					if apierrors.IsNotFound(err) {
+						return true, nil
+					}
+					return false, err
+				}
+				return false, nil
+			})
+		errs = append(errs, errors.Wrapf(err, "key %s, %s is not being deleted from the testenv client cache", o.GetObjectKind().GroupVersionKind().String(), key))
+	}
+	return kerrors.NewAggregate(errs)
+}
+
+// CreateAndWait creates the given object and waits for the cache to be updated accordingly.
+//
+// NOTE: Waiting for the cache to be updated helps in preventing test flakes due to the cache sync delays.
+func (e *Environment) CreateAndWait(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if err := e.Client.Create(ctx, obj, opts...); err != nil {
+		return err
+	}
+
+	// Makes sure the cache is updated with the new object
+	objCopy := obj.DeepCopyObject().(client.Object)
+	key := client.ObjectKeyFromObject(obj)
+	if err := wait.ExponentialBackoff(
+		cacheSyncBackoff,
+		func() (done bool, err error) {
+			if err := e.Get(ctx, key, objCopy); err != nil {
+				if apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			return true, nil
+		}); err != nil {
+		return errors.Wrapf(err, "object %s, %s is not being added to the testenv client cache", obj.GetObjectKind().GroupVersionKind().String(), key)
+	}
+	return nil
+}
+
+// CreateNamespace creates a new namespace with a generated name.
+func (e *Environment) CreateNamespace(ctx context.Context, generateName string) (*corev1.Namespace, error) {
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-", generateName),
+			Labels: map[string]string{
+				"testenv/original-name": generateName,
+			},
+		},
+	}
+	if err := e.Client.Create(ctx, ns); err != nil {
+		return nil, err
+	}
+	return ns, nil
+}
+
+// AddUser provisions a new user for connecting to this Environment. The user
+// will have the specified name & belong to the specified groups.
+//
+// If a "base" config is specified, the returned REST Config will contain those
+// settings as well as any required by the authentication method. It can also
+// be used to specify options like QPS.
+func (e *Environment) AddUser(user envtest.User, baseConfig *rest.Config) (*envtest.AuthenticatedUser, error) {
+	return e.env.AddUser(user, baseConfig)
+}

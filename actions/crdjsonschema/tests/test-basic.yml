@@ -1,0 +1,51 @@
+name: Test basic single-version CRD
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Clean output dir
+        run: rm -rf "$GITHUB_WORKSPACE/schemas-basic" || sudo rm -rf "$GITHUB_WORKSPACE/schemas-basic" || true
+      - id: action
+        uses: .
+        with:
+          crd: tests/fixtures/widget-crd.yaml
+          output: schemas-basic
+      - name: Assert schema files generated
+        run: |
+          OUT="$GITHUB_WORKSPACE/schemas-basic"
+          ls -la "$OUT" || true
+          for f in widget-example-v1.json _definitions.json all.json; do
+            if [ ! -f "$OUT/$f" ]; then
+              echo "FAIL: missing $f"
+              exit 1
+            fi
+          done
+          echo "PASS: files present"
+      - name: Assert schema content
+        run: |
+          OUT="$GITHUB_WORKSPACE/schemas-basic"
+          cat "$OUT/widget-example-v1.json"
+          python3 - "$OUT" <<'EOF'
+          import json, sys, os
+          out = sys.argv[1]
+          s = json.load(open(os.path.join(out, "widget-example-v1.json")))
+          assert s["type"] == "object", "root type"
+          assert "spec" in s["properties"], "spec missing"
+          spec = s["properties"]["spec"]
+          assert spec.get("additionalProperties") is False, "spec additionalProperties should be false"
+          assert spec["properties"]["size"]["type"] == "integer"
+          port = spec["properties"]["port"]
+          assert port == {"oneOf": [{"type": "string"}, {"type": "integer"}]}, "int-or-string not replaced: %r" % port
+          d = json.load(open(os.path.join(out, "_definitions.json")))
+          key = "example.com.v1.Widget"
+          assert key in d["definitions"], "missing definition %s" % key
+          dd = d["definitions"][key]
+          assert dd["properties"]["apiVersion"]["enum"] == ["example.com/v1"]
+          assert dd["properties"]["kind"]["enum"] == ["Widget"]
+          a = json.load(open(os.path.join(out, "all.json")))
+          assert a == {"oneOf": [{"$ref": "_definitions.json#/definitions/example.com.v1.Widget"}]}, a
+          print("PASS: schema content valid")
+          EOF

@@ -1,0 +1,26 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 1.28.3
+      - name: Assert kubectl v1.28.3 installed under v-prefixed dir
+        run: |
+          OUT="$(kubectl version --client 2>&1)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "v1.28.3"; then
+            echo "FAIL: expected v1.28.3"
+            exit 1
+          fi
+          if [ ! -d "$RUNNER_TOOL_CACHE/kubectl/v1.28.3" ]; then
+            echo "FAIL: expected tool dir $RUNNER_TOOL_CACHE/kubectl/v1.28.3"
+            ls -la "$RUNNER_TOOL_CACHE/kubectl" || true
+            exit 1
+          fi
+          echo "PASS"

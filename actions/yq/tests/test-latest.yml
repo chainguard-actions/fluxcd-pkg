@@ -1,0 +1,23 @@
+name: Test latest version (no input)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+      - name: Assert yq installed
+        run: |
+          ACTUAL="$(yq --version)"
+          echo "actual: $ACTUAL"
+          if ! echo "$ACTUAL" | grep -qE "v?[0-9]+\.[0-9]+\.[0-9]+"; then
+            echo "FAIL: expected a semver in yq --version output"
+            exit 1
+          fi
+          case "$(which yq)" in
+            "$RUNNER_TOOL_CACHE"/yq/v*) ;;
+            *) echo "FAIL: yq not from tool cache dir: $(which yq)"; exit 1 ;;
+          esac
+          echo "PASS"

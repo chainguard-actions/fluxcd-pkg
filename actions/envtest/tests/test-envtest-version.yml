@@ -1,0 +1,39 @@
+name: Test specific setup-envtest version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          envtest_version: release-0.21
+      - name: Assert VERSION env and tool cache dir
+        run: |
+          echo "VERSION: $VERSION"
+          if [ "$VERSION" != "release-0.21" ]; then
+            echo "FAIL: expected VERSION=release-0.21"
+            exit 1
+          fi
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          BIN="${RUNNER_TOOL_CACHE}/setup-envtest/release-0.21/${OS}/${ARCH}/setup-envtest"
+          echo "expected binary: $BIN"
+          if [ ! -x "$BIN" ]; then
+            echo "FAIL: setup-envtest binary not found in tool cache"
+            exit 1
+          fi
+          echo "on PATH: $(command -v setup-envtest)"
+          if [ "$(command -v setup-envtest)" != "$BIN" ]; then
+            echo "FAIL: PATH setup-envtest is not the versioned binary"
+            exit 1
+          fi
+          ASSETS="${KUBEBUILDER_ASSETS//\'/}"
+          echo "assets: $ASSETS"
+          if [ ! -x "$ASSETS/kube-apiserver" ]; then
+            echo "FAIL: kube-apiserver missing"
+            exit 1
+          fi
+          echo "PASS"

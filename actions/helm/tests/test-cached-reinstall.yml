@@ -1,0 +1,47 @@
+name: Test cached reinstall
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Put expected helm tool dir on PATH (installer verifies helm via PATH)
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          echo "${RUNNER_TOOL_CACHE}/helm/v3.14.0/${OS}/${ARCH}" >> "$GITHUB_PATH"
+      - id: first
+        uses: .
+        with:
+          version: v3.14.0
+      - name: Record mtime of installed binary
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          P="${RUNNER_TOOL_CACHE}/helm/v3.14.0/${OS}/${ARCH}/helm"
+          stat -c %Y "$P" > /tmp/helm-mtime
+          cat /tmp/helm-mtime
+          sleep 2
+      - id: second
+        uses: .
+        with:
+          version: v3.14.0
+      - name: Assert binary reused from cache
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          P="${RUNNER_TOOL_CACHE}/helm/v3.14.0/${OS}/${ARCH}/helm"
+          BEFORE="$(cat /tmp/helm-mtime)"
+          AFTER="$(stat -c %Y "$P")"
+          echo "before: $BEFORE after: $AFTER"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "FAIL: binary was re-downloaded"
+            exit 1
+          fi
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          case "$ACTUAL" in
+            v3.14.0*) echo "PASS" ;;
+            *) echo "FAIL: expected v3.14.0"; exit 1 ;;
+          esac

@@ -1,0 +1,25 @@
+name: Test cached reinstall
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: first
+        uses: .
+        with:
+          version: v0.6.7
+      - id: second
+        uses: .
+        with:
+          version: v0.6.7
+      - name: Assert kubeconform still works after cached run
+        run: |
+          ACTUAL="$(kubeconform -v)"
+          echo "actual: $ACTUAL"
+          if [[ "$ACTUAL" != *"0.6.7"* ]]; then
+            echo "FAIL: expected version 0.6.7"
+            exit 1
+          fi
+          echo "PASS"

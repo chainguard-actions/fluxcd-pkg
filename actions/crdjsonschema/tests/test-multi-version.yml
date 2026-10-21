@@ -1,0 +1,44 @@
+name: Test multi-document, multi-version CRDs
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Clean output dir
+        run: rm -rf "$GITHUB_WORKSPACE/schemas-multi" || sudo rm -rf "$GITHUB_WORKSPACE/schemas-multi" || true
+      - id: action
+        uses: .
+        with:
+          crd: tests/fixtures/multi-crd.yaml
+          output: schemas-multi/nested
+      - name: Assert schema files generated
+        run: |
+          OUT="$GITHUB_WORKSPACE/schemas-multi/nested"
+          ls -la "$OUT" || true
+          for f in gadget-demo-v1beta1.json gadget-demo-v1.json gizmo-demo-v1.json _definitions.json all.json; do
+            if [ ! -f "$OUT/$f" ]; then
+              echo "FAIL: missing $f"
+              exit 1
+            fi
+          done
+          echo "PASS: files present"
+      - name: Assert definitions and all.json
+        run: |
+          OUT="$GITHUB_WORKSPACE/schemas-multi/nested"
+          cat "$OUT/all.json"
+          python3 - "$OUT" <<'EOF'
+          import json, sys, os
+          out = sys.argv[1]
+          d = json.load(open(os.path.join(out, "_definitions.json")))["definitions"]
+          expected = {"demo.example.org.v1beta1.Gadget", "demo.example.org.v1.Gadget", "demo.example.org.v1.Gizmo"}
+          assert set(d.keys()) == expected, "definitions keys: %r" % sorted(d.keys())
+          refs = {r["$ref"] for r in json.load(open(os.path.join(out, "all.json")))["oneOf"]}
+          assert refs == {"_definitions.json#/definitions/" + k for k in expected}, refs
+          g1 = json.load(open(os.path.join(out, "gadget-demo-v1.json")))
+          assert "weight" in g1["properties"]["spec"]["properties"]
+          gb = json.load(open(os.path.join(out, "gadget-demo-v1beta1.json")))
+          assert "weight" not in gb["properties"]["spec"]["properties"]
+          print("PASS: multi-version schemas valid")
+          EOF

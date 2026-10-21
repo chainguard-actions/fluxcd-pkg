@@ -1,0 +1,35 @@
+name: Test pinned version with v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v4.44.3
+      - name: Assert yq installed at requested version
+        run: |
+          which yq
+          ACTUAL="$(yq --version)"
+          echo "actual: $ACTUAL"
+          if ! echo "$ACTUAL" | grep -q "4.44.3"; then
+            echo "FAIL: expected yq version 4.44.3"
+            exit 1
+          fi
+          case "$(which yq)" in
+            "$RUNNER_TOOL_CACHE"/yq/v4.44.3/*) ;;
+            *) echo "FAIL: yq not from tool cache dir"; exit 1 ;;
+          esac
+          echo "PASS"
+      - name: Assert yq works
+        run: |
+          OUT="$(echo 'a: {b: hello}' | yq '.a.b')"
+          echo "out: $OUT"
+          if [ "$OUT" != "hello" ]; then
+            echo "FAIL: yq did not evaluate expression"
+            exit 1
+          fi
+          echo "PASS"

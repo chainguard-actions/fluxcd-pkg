@@ -1,0 +1,25 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 0.6.6
+      - name: Assert version normalized and installed
+        run: |
+          ACTUAL="$(kubeconform -v)"
+          echo "actual: $ACTUAL"
+          if [[ "$ACTUAL" != *"0.6.6"* ]]; then
+            echo "FAIL: expected version 0.6.6"
+            exit 1
+          fi
+          if ! ls "${RUNNER_TOOL_CACHE}/kubeconform/v0.6.6/linux"/*/kubeconform >/dev/null 2>&1; then
+            echo "FAIL: expected tool cache dir with v-prefixed version"
+            exit 1
+          fi
+          echo "PASS"

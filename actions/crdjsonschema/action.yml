@@ -1,0 +1,19 @@
+name: crdjsonschema
+description: Generate OpenAPI JSON schemas from Custom Resource Definitions
+author: Flux project
+branding:
+  icon: 'command'
+  color: 'blue'
+inputs:
+  crd:
+    description: 'Local path or URL of the CRD YAML file'
+    required: true
+  output:
+    description: 'Path to a local dir where to write the JSON file'
+    required: true
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  args:
+    - ${{ inputs.crd }}
+    - ${{ inputs.output }}

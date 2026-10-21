@@ -1,0 +1,45 @@
+name: Test latest version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Resolve latest helm release and put its tool dir on PATH
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          LATEST=$(curl -fsSL -H "Authorization: token ${TOKEN}" https://api.github.com/repos/helm/helm/releases/latest | grep tag_name | cut -d '"' -f 4)
+          echo "latest: $LATEST"
+          if [ -z "$LATEST" ]; then
+            echo "FAIL: could not resolve latest helm release"
+            exit 1
+          fi
+          echo "$LATEST" > /tmp/helm-latest
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          echo "${RUNNER_TOOL_CACHE}/helm/${LATEST}/${OS}/${ARCH}" >> "$GITHUB_PATH"
+      - id: action
+        uses: .
+      - name: Assert helm installed
+        run: |
+          which helm
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          case "$ACTUAL" in
+            v*) echo "PASS: helm reports a version" ;;
+            *) echo "FAIL: unexpected helm version output"; exit 1 ;;
+          esac
+          if ! ls -d "${RUNNER_TOOL_CACHE}"/helm/v*; then
+            echo "FAIL: no helm version dir in tool cache"
+            exit 1
+          fi
+          LATEST="$(cat /tmp/helm-latest)"
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          if [ ! -x "${RUNNER_TOOL_CACHE}/helm/${LATEST}/${OS}/${ARCH}/helm" ]; then
+            echo "FAIL: expected helm at tool cache dir for ${LATEST}"
+            exit 1
+          fi
+          echo "PASS"

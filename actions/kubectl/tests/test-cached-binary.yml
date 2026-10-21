@@ -1,0 +1,30 @@
+name: Test cached binary reuse
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Pre-populate tool cache with a fake kubectl
+        run: |
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          if [ "$ARCH" = "x64" ]; then ARCH=amd64; elif [ "$ARCH" = "x86" ]; then ARCH=386; fi
+          DIR="${RUNNER_TOOL_CACHE}/kubectl/v9.99.99/linux/${ARCH}"
+          mkdir -p "$DIR"
+          printf '#!/bin/sh\necho "fake-kubectl-cached v9.99.99"\n' > "$DIR/kubectl"
+          chmod +x "$DIR/kubectl"
+          echo "Created $DIR/kubectl"
+      - id: action
+        uses: .
+        with:
+          version: v9.99.99
+      - name: Assert cached fake kubectl was used
+        run: |
+          OUT="$(kubectl version --client 2>&1)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "fake-kubectl-cached"; then
+            echo "FAIL: expected cached fake kubectl to be used"
+            exit 1
+          fi
+          echo "PASS"

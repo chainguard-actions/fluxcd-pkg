@@ -1,0 +1,31 @@
+name: Test specific Kubernetes version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          k8s_version: "1.30.x"
+      - name: Assert KUBEBUILDER_ASSETS points to requested version
+        run: |
+          ASSETS="${KUBEBUILDER_ASSETS//\'/}"
+          echo "assets: $ASSETS"
+          case "$ASSETS" in
+            *1.30.*) ;;
+            *) echo "FAIL: expected path to contain 1.30."; exit 1 ;;
+          esac
+          if [ ! -x "$ASSETS/kube-apiserver" ]; then
+            echo "FAIL: kube-apiserver missing"
+            exit 1
+          fi
+          VER="$("$ASSETS/kube-apiserver" --version)"
+          echo "kube-apiserver version: $VER"
+          case "$VER" in
+            *v1.30.*) ;;
+            *) echo "FAIL: expected kube-apiserver v1.30.x"; exit 1 ;;
+          esac
+          echo "PASS"
