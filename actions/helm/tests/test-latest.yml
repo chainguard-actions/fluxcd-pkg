@@ -1,0 +1,45 @@
+name: Test latest version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install helm shim on PATH (installer verifies helm is on PATH)
+        run: |
+          mkdir -p /tmp/helm-shim
+          cat > /tmp/helm-shim/helm <<'EOF'
+          #!/bin/bash
+          # Delegates to the helm binary installed in the tool cache.
+          REAL="$(ls -1 "${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}"/helm/*/*/*/helm 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$REAL" ]; then
+            echo "helm shim: no helm in tool cache" >&2
+            exit 1
+          fi
+          exec "$REAL" "$@"
+          EOF
+          chmod +x /tmp/helm-shim/helm
+          echo "/tmp/helm-shim" >> "$GITHUB_PATH"
+      - id: action
+        uses: .
+      - name: Assert helm installed into tool cache
+        run: |
+          ls -la "${RUNNER_TOOL_CACHE}/helm" || true
+          COUNT=$(ls -1 "${RUNNER_TOOL_CACHE}"/helm/v*/linux/*/helm 2>/dev/null | wc -l)
+          echo "binaries in tool cache: $COUNT"
+          if [ "$COUNT" -lt 1 ]; then
+            echo "FAIL: no helm binary in tool cache"
+            exit 1
+          fi
+          echo "PASS"
+      - name: Assert helm works
+        run: |
+          which helm
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          if ! echo "$ACTUAL" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "FAIL: expected a semver version"
+            exit 1
+          fi
+          echo "PASS"

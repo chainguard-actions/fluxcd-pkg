@@ -1,0 +1,36 @@
+name: Test multi-document multi-version CRDs
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          crd: tests/fixtures/multi-crd.yaml
+          output: nested/schemas/out-multi
+      - name: Assert schema files generated
+        run: |
+          OUT="$GITHUB_WORKSPACE/nested/schemas/out-multi"
+          ls -la "$OUT" || { echo "FAIL: output dir missing"; exit 1; }
+          for f in gadget-toys-v1beta1.json gadget-toys-v1.json gizmo-toys-v2.json _definitions.json all.json; do
+            if [ ! -s "$OUT/$f" ]; then
+              echo "FAIL: missing $f"
+              exit 1
+            fi
+          done
+          python3 - "$OUT" <<'EOF'
+          import json, sys, os
+          out = sys.argv[1]
+          d = json.load(open(os.path.join(out, "_definitions.json")))["definitions"]
+          print(sorted(d.keys()))
+          for k in ["toys.example.com.v1beta1.Gadget", "toys.example.com.v1.Gadget", "toys.example.com.v2.Gizmo"]:
+              assert k in d, "missing " + k
+          a = json.load(open(os.path.join(out, "all.json")))
+          assert len(a["oneOf"]) == 3, a
+          g = json.load(open(os.path.join(out, "gadget-toys-v1.json")))
+          assert "count" in g["properties"]["spec"]["properties"]
+          print("PASS")
+          EOF

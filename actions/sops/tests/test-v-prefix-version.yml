@@ -1,0 +1,29 @@
+name: Test v-prefixed version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v3.8.1
+      - name: Assert sops 3.8.1 installed
+        run: |
+          OUT="$(sops --version --disable-version-check 2>&1 || sops --version 2>&1)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "3.8.1"; then
+            echo "FAIL: expected version 3.8.1"
+            exit 1
+          fi
+          if ls "$RUNNER_TOOL_CACHE"/sops/vv3.8.1 >/dev/null 2>&1; then
+            echo "FAIL: version was double-prefixed"
+            exit 1
+          fi
+          if ! ls "$RUNNER_TOOL_CACHE"/sops/v3.8.1/linux/*/sops >/dev/null 2>&1; then
+            echo "FAIL: expected sops in v3.8.1 tool cache dir"
+            exit 1
+          fi
+          echo "PASS"

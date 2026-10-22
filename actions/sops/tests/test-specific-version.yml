@@ -1,0 +1,30 @@
+name: Test specific version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 3.9.0
+      - name: Assert sops 3.9.0 installed and on PATH
+        run: |
+          which sops || { echo "FAIL: sops not on PATH"; exit 1; }
+          OUT="$(sops --version --disable-version-check 2>&1 || sops --version 2>&1)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "3.9.0"; then
+            echo "FAIL: expected version 3.9.0"
+            exit 1
+          fi
+          echo "PASS"
+      - name: Assert installed in tool cache with v-prefixed dir
+        run: |
+          ls -R "$RUNNER_TOOL_CACHE/sops" || true
+          if ! ls "$RUNNER_TOOL_CACHE"/sops/v3.9.0/linux/*/sops >/dev/null 2>&1; then
+            echo "FAIL: sops not found under $RUNNER_TOOL_CACHE/sops/v3.9.0/linux/<arch>/"
+            exit 1
+          fi
+          echo "PASS"

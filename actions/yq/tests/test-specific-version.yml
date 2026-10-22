@@ -1,0 +1,31 @@
+name: Test specific version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v4.44.3
+      - name: Assert yq installed at requested version
+        run: |
+          echo "yq path: $(command -v yq)"
+          OUT="$(yq --version)"
+          echo "version output: $OUT"
+          if ! echo "$OUT" | grep -q "v4.44.3"; then
+            echo "FAIL: expected yq v4.44.3"
+            exit 1
+          fi
+          case "$(command -v yq)" in
+            "$RUNNER_TOOL_CACHE/yq/v4.44.3/"*) ;;
+            *) echo "FAIL: yq not resolved from tool cache"; exit 1 ;;
+          esac
+          if [ ! -x "$RUNNER_TOOL_CACHE/yq/v4.44.3/linux/amd64/yq" ] && [ ! -x "$RUNNER_TOOL_CACHE/yq/v4.44.3/linux/arm64/yq" ]; then
+            echo "FAIL: binary not found in tool cache"
+            exit 1
+          fi
+          echo 'a: {b: hello}' | yq '.a.b' | grep -qx hello || { echo "FAIL: yq did not evaluate"; exit 1; }
+          echo "PASS"

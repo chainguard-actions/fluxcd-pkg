@@ -1,0 +1,24 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 1.29.2
+      - name: Assert kubectl installed with normalized version
+        run: |
+          OUT="$(kubectl version --client 2>&1)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "v1.29.2"; then
+            echo "FAIL: expected kubectl v1.29.2"
+            exit 1
+          fi
+          case "$(which kubectl)" in
+            */kubectl/v1.29.2/*) echo "PASS: v prefix added to tool dir" ;;
+            *) echo "FAIL: unexpected path $(which kubectl)"; exit 1 ;;
+          esac

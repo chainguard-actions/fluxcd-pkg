@@ -1,0 +1,973 @@
+/*
+Copyright 2021 Stefan Prodan
+Copyright 2021 The Flux authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package ssa
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-openapi/jsonpointer"
+	"golang.org/x/sync/errgroup"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	ssaerrors "github.com/fluxcd/pkg/ssa/errors"
+	"github.com/fluxcd/pkg/ssa/jsondiff"
+	"github.com/fluxcd/pkg/ssa/utils"
+)
+
+// ApplyOptions contains options for server-side apply requests.
+type ApplyOptions struct {
+	// Force configures the engine to recreate objects that contain immutable field changes.
+	Force bool `json:"force"`
+
+	// ForceSelector determines which in-cluster objects are Force applied
+	// based on the matching labels or annotations.
+	ForceSelector map[string]string `json:"forceSelector"`
+
+	// ExclusionSelector determines which in-cluster objects are skipped from apply
+	// based on the matching labels or annotations.
+	ExclusionSelector map[string]string `json:"exclusionSelector"`
+
+	// IfNotPresentSelector determines which in-cluster objects are skipped from patching
+	// based on the matching labels or annotations.
+	IfNotPresentSelector map[string]string `json:"ifNotPresentSelector"`
+
+	// WaitInterval defines the interval at which the engine polls for cluster
+	// scoped resources to reach their final state.
+	WaitInterval time.Duration `json:"waitInterval"`
+
+	// WaitTimeout defines after which interval should the engine give up on waiting for
+	// cluster scoped resources to reach their final state.
+	WaitTimeout time.Duration `json:"waitTimeout"`
+
+	// Cleanup defines which in-cluster metadata entries are to be removed before applying objects.
+	Cleanup ApplyCleanupOptions `json:"cleanup"`
+
+	// CustomStageKinds defines a set of Kubernetes resource types that should be applied
+	// in a separate stage after CRDs and before namespaced objects.
+	CustomStageKinds map[schema.GroupKind]struct{} `json:"customStageKinds,omitempty"`
+
+	// MigrateAPIVersion, when enabled, rewrites every managed fields entry
+	// on the existing object to match the API version of the applied object
+	// before each apply.
+	//
+	// This is needed after a CRD adds a new version that introduces fields
+	// with default values: without migration, any managed fields entry still
+	// tagged with the old API version causes the API server to fail the
+	// apply with "field not declared in schema" for the new defaulted field.
+	MigrateAPIVersion bool `json:"migrateAPIVersion,omitempty"`
+
+	// DriftIgnoreRules defines a list of JSON pointer ignore rules that are used to
+	// remove specific fields from objects before applying them.
+	// This is useful for ignoring fields that are managed by other controllers
+	// (e.g. VPA, HPA) and would otherwise cause drift.
+	DriftIgnoreRules []jsondiff.IgnoreRule `json:"driftIgnoreRules,omitempty"`
+}
+
+// ApplyCleanupOptions defines which metadata entries are to be removed before applying objects.
+type ApplyCleanupOptions struct {
+	// Annotations defines which 'metadata.annotations' keys should be removed from in-cluster objects.
+	Annotations []string `json:"annotations,omitempty"`
+
+	// Labels defines which 'metadata.labels' keys should be removed from in-cluster objects.
+	Labels []string `json:"labels,omitempty"`
+
+	// FieldManagers defines which `metadata.managedFields` managers should be removed from in-cluster objects.
+	FieldManagers []FieldManager `json:"fieldManagers,omitempty"`
+
+	// Exclusions determines which in-cluster objects are skipped from cleanup
+	// based on the specified key-value pairs.
+	Exclusions map[string]string `json:"exclusions"`
+}
+
+// DefaultApplyOptions returns the default apply options where force apply is disabled.
+func DefaultApplyOptions() ApplyOptions {
+	return ApplyOptions{
+		Force:             false,
+		ExclusionSelector: nil,
+		WaitInterval:      2 * time.Second,
+		WaitTimeout:       60 * time.Second,
+	}
+}
+
+// Apply performs a server-side apply of the given object if the matching in-cluster object is different or if it doesn't exist.
+// Drift detection is performed by comparing the server-side dry-run result with the existing object.
+// When immutable field changes are detected, the object is recreated if 'force' is set to 'true'.
+func (m *ResourceManager) Apply(ctx context.Context, object *unstructured.Unstructured, opts ApplyOptions) (*ChangeSetEntry, error) {
+	existingObject := &unstructured.Unstructured{}
+	existingObject.SetGroupVersionKind(object.GroupVersionKind())
+	getError := m.client.Get(ctx, client.ObjectKeyFromObject(object), existingObject)
+
+	if shouldSkip, skippedEntry := m.shouldSkipApply(object, existingObject, opts); shouldSkip {
+		return skippedEntry, nil
+	}
+
+	// This runs before dry-run because it fixes an error that happens during dry-run, for example:
+	//   "dry-run failed: .spec.accessPolicy: field not declared in schema"
+	// See https://github.com/fluxcd/flux2/issues/5715.
+	//
+	// This is sort of a dangerous operation to perform, because our code does not know the details
+	// and behavior of every possible resource whose API version is being migrated to properly migrate
+	// the fields. However, if there's no fields that really need to be migrated, Flux users can fix
+	// stale field managers by enabling the MigrateAPIVersion feature gate in kustomize-controller and
+	// then disable immediately after the migration is done to keep the danger away. An example of
+	// situation when this was useful is when external-secrets shipped a v1 API and removed the v1beta*
+	// version in too short of a time frame, so lots of objects still lived in users' clusters with the
+	// old API version still in the managedFields entries. Unfortunately, Kubernetes does not have a
+	// prescribed way for ecosystem controllers to migrate these managedFields entries, so Flux provides
+	// this workaround for users to fix their clusters when they encounter this problem.
+	//
+	// Keep this comment synced with ApplyAll().
+	var patched bool
+	if opts.MigrateAPIVersion && getError == nil {
+		var err error
+		patched, err = m.migrateAPIVersion(ctx, existingObject, object.GetAPIVersion())
+		if err != nil {
+			return nil, fmt.Errorf("%s failed to migrate API version: %w", utils.FmtUnstructured(existingObject), err)
+		}
+	}
+
+	dryRunObject := object.DeepCopy()
+	if err := m.dryRunApply(ctx, dryRunObject); err != nil {
+		if !errors.IsNotFound(getError) && m.shouldForceApply(object, existingObject, opts, err) {
+			if err := m.client.Delete(ctx, existingObject, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+				return nil, fmt.Errorf("%s immutable field detected, failed to delete object: %w",
+					utils.FmtUnstructured(dryRunObject), err)
+			}
+			return m.Apply(ctx, object, opts)
+		}
+
+		return nil, ssaerrors.NewDryRunErr(err, dryRunObject)
+	}
+
+	patchedCleanupMetadata, err := m.cleanupMetadata(ctx, object, existingObject, opts.Cleanup)
+	if err != nil {
+		return nil, fmt.Errorf("%s metadata.managedFields cleanup failed: %w",
+			utils.FmtUnstructured(existingObject), err)
+	}
+	patched = patched || patchedCleanupMetadata
+
+	// Compile ignore rules once for both drift detection and conditional field stripping.
+	var compiled jsondiff.CompiledIgnoreRules
+	if existingObject.GetResourceVersion() != "" && len(opts.DriftIgnoreRules) > 0 {
+		compiled, err = jsondiff.CompileIgnoreRules(opts.DriftIgnoreRules)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Do not apply objects that have not drifted to avoid bumping the resource version.
+	// Ignored fields are excluded from the comparison so that differences in fields
+	// managed by other controllers (e.g. VPA, HPA) do not trigger unnecessary applies.
+	drifted, err := m.hasDriftedWithIgnore(existingObject, dryRunObject, compiled)
+	if err != nil {
+		return nil, err
+	}
+	if !patched && !drifted {
+		return m.changeSetEntry(object, UnchangedAction), nil
+	}
+
+	appliedObject := object.DeepCopy()
+
+	// For each drifted ignored field, either strip it from the payload (when
+	// another Apply manager owns it) or adopt the in-cluster value (when Flux
+	// is the sole owner) to avoid API errors and silent value corruption.
+	if compiled != nil {
+		dr := computeDriftedPaths(existingObject, dryRunObject, compiled, m.owner.Field)
+		if err := applyDriftResult(appliedObject, dr); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := m.apply(ctx, appliedObject); err != nil {
+		return nil, fmt.Errorf("%s apply failed: %w", utils.FmtUnstructured(appliedObject), err)
+	}
+
+	if dryRunObject.GetResourceVersion() == "" {
+		return m.changeSetEntry(appliedObject, CreatedAction), nil
+	}
+
+	return m.changeSetEntry(appliedObject, ConfiguredAction), nil
+}
+
+// ApplyAll performs a server-side dry-run of the given objects, and based on the diff result,
+// it applies the objects that are new or modified.
+func (m *ResourceManager) ApplyAll(ctx context.Context, objects []*unstructured.Unstructured, opts ApplyOptions) (*ChangeSet, error) {
+	sort.Sort(SortableUnstructureds(objects))
+
+	// Results are written to the following arrays from the concurrent goroutines. We use arrays
+	// to avoid complex synchronization. toApply is sparse, slots are only popuplated when there
+	// is an object to apply
+	toApply := make([]*unstructured.Unstructured, len(objects))
+	changes := make([]ChangeSetEntry, len(objects))
+	driftResults := make([]driftResult, len(objects))
+
+	// Compile ignore rules once for drift detection and conditional field stripping.
+	var compiled jsondiff.CompiledIgnoreRules
+	if len(opts.DriftIgnoreRules) > 0 {
+		var err error
+		compiled, err = jsondiff.CompileIgnoreRules(opts.DriftIgnoreRules)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	{
+		g, ctx := errgroup.WithContext(ctx)
+		g.SetLimit(m.concurrency)
+		for i, object := range objects {
+
+			g.Go(func() error {
+				utils.RemoveCABundleFromCRD(object)
+
+				existingObject := &unstructured.Unstructured{}
+				existingObject.SetGroupVersionKind(object.GroupVersionKind())
+				getError := m.client.Get(ctx, client.ObjectKeyFromObject(object), existingObject)
+
+				if shouldSkip, skippedEntry := m.shouldSkipApply(object, existingObject, opts); shouldSkip {
+					changes[i] = *skippedEntry
+					return nil
+				}
+
+				// This runs before dry-run because it fixes an error that happens during dry-run, for example:
+				//   "dry-run failed: .spec.accessPolicy: field not declared in schema"
+				// See https://github.com/fluxcd/flux2/issues/5715.
+				//
+				// This is sort of a dangerous operation to perform, because our code does not know the details
+				// and behavior of every possible resource whose API version is being migrated to properly migrate
+				// the fields. However, if there's no fields that really need to be migrated, Flux users can fix
+				// stale field managers by enabling the MigrateAPIVersion feature gate in kustomize-controller and
+				// then disable immediately after the migration is done to keep the danger away. An example of
+				// situation when this was useful is when external-secrets shipped a v1 API and removed the v1beta*
+				// version in too short of a time frame, so lots of objects still lived in users' clusters with the
+				// old API version still in the managedFields entries. Unfortunately, Kubernetes does not have a
+				// prescribed way for ecosystem controllers to migrate these managedFields entries, so Flux provides
+				// this workaround for users to fix their clusters when they encounter this problem.
+				//
+				// Keep this comment synced with Apply().
+				var patched bool
+				if opts.MigrateAPIVersion && getError == nil {
+					var err error
+					patched, err = m.migrateAPIVersion(ctx, existingObject, object.GetAPIVersion())
+					if err != nil {
+						return fmt.Errorf("%s failed to migrate API version: %w", utils.FmtUnstructured(existingObject), err)
+					}
+				}
+
+				dryRunObject := object.DeepCopy()
+				if err := m.dryRunApply(ctx, dryRunObject); err != nil {
+					// We cannot have an immutable error (and therefore shouldn't force-apply) if the resource doesn't
+					// exist on the cluster. Note that resource might not exist because we wrongly identified an error
+					// as immutable and deleted it when ApplyAll was called the last time (the check for ImmutableError
+					// returns false positives)
+					if !errors.IsNotFound(getError) && m.shouldForceApply(object, existingObject, opts, err) {
+						if err := m.client.Delete(ctx, existingObject, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+							return fmt.Errorf("%s immutable field detected, failed to delete object: %w",
+								utils.FmtUnstructured(dryRunObject), err)
+						}
+
+						// Wait until deleted (in case of any finalizers).
+						err = wait.PollUntilContextCancel(ctx, opts.WaitInterval, true, func(ctx context.Context) (bool, error) {
+							err := m.client.Get(ctx, client.ObjectKeyFromObject(object), existingObject)
+							if err != nil && errors.IsNotFound(err) {
+								// Object has been deleted.
+								return true, nil
+							}
+							// Object still exists, or we got another error than NotFound.
+							return false, err
+						})
+						if err != nil {
+							return fmt.Errorf("%s immutable field detected, failed to wait for object to be deleted: %w",
+								utils.FmtUnstructured(dryRunObject), err)
+						}
+
+						err = m.dryRunApply(ctx, dryRunObject)
+					}
+
+					if err != nil {
+						return ssaerrors.NewDryRunErr(err, dryRunObject)
+					}
+				}
+
+				patchedCleanupMetadata, err := m.cleanupMetadata(ctx, object, existingObject, opts.Cleanup)
+				if err != nil {
+					return fmt.Errorf("%s metadata.managedFields cleanup failed: %w",
+						utils.FmtUnstructured(existingObject), err)
+				}
+				patched = patched || patchedCleanupMetadata
+
+				drifted, err := m.hasDriftedWithIgnore(existingObject, dryRunObject, compiled)
+				if err != nil {
+					return err
+				}
+				if patched || drifted {
+					toApply[i] = object
+					// Compute drifted paths while existingObject and dryRunObject are available.
+					if compiled != nil && existingObject.GetResourceVersion() != "" {
+						driftResults[i] = computeDriftedPaths(existingObject, dryRunObject, compiled, m.owner.Field)
+					}
+					if dryRunObject.GetResourceVersion() == "" {
+						changes[i] = *m.changeSetEntry(dryRunObject, CreatedAction)
+					} else {
+						changes[i] = *m.changeSetEntry(dryRunObject, ConfiguredAction)
+					}
+				} else {
+					changes[i] = *m.changeSetEntry(dryRunObject, UnchangedAction)
+				}
+				return nil
+			})
+		}
+
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+	}
+
+	for i, object := range toApply {
+		if object != nil {
+			appliedObject := object.DeepCopy()
+			if changes[i].Action != CreatedAction && len(driftResults[i].entries) > 0 {
+				if err := applyDriftResult(appliedObject, driftResults[i]); err != nil {
+					return nil, err
+				}
+			}
+			if err := m.apply(ctx, appliedObject); err != nil {
+				return nil, fmt.Errorf("%s apply failed: %w", utils.FmtUnstructured(appliedObject), err)
+			}
+		}
+	}
+
+	changeSet := NewChangeSet()
+	changeSet.Append(changes)
+
+	return changeSet, nil
+}
+
+// ApplyAllStaged extracts the cluster and class definitions, applies them with ApplyAll,
+// waits for them to become ready, then it applies all the other objects.
+// This function should be used when the given objects have a mix of custom resource definition
+// and custom resources, or a mix of namespace definitions with namespaced objects.
+// If an error occurs during the apply of the cluster or class definitions, the change set is
+// returned with the applied entries, up to that point, and the error is returned.
+func (m *ResourceManager) ApplyAllStaged(ctx context.Context, objects []*unstructured.Unstructured, opts ApplyOptions) (*ChangeSet, error) {
+	changeSet := NewChangeSet()
+
+	var (
+		// Contains only CRDs, ClusterRoles, and Namespaces.
+		defStage []*unstructured.Unstructured
+
+		// Contains only Class definitions.
+		classStage []*unstructured.Unstructured
+
+		// Contains the custom kinds.
+		customStage []*unstructured.Unstructured
+
+		// Contains all objects except for cluster definitions and class definitions.
+		resStage []*unstructured.Unstructured
+	)
+
+	for _, o := range objects {
+		switch {
+		case utils.IsClusterDefinition(o):
+			defStage = append(defStage, o)
+		case utils.IsClassDefinition(o):
+			classStage = append(classStage, o)
+		case utils.IsCustomStage(o, opts.CustomStageKinds):
+			customStage = append(customStage, o)
+		default:
+			resStage = append(resStage, o)
+		}
+	}
+
+	// Apply CRDs, ClusterRoles, and Namespaces first and wait for them to become ready.
+	if len(defStage) > 0 {
+		cs, err := m.ApplyAll(ctx, defStage, opts)
+		if err != nil {
+			return changeSet, err
+		}
+		changeSet.Append(cs.Entries)
+
+		if err := m.WaitForSet(cs.ToObjMetadataSet(), WaitOptions{Interval: opts.WaitInterval, Timeout: opts.WaitTimeout}); err != nil {
+			return changeSet, err
+		}
+	}
+
+	// Apply Class definitions next, if any, and wait for them to become ready.
+	if len(classStage) > 0 {
+		cs, err := m.ApplyAll(ctx, classStage, opts)
+		if err != nil {
+			return changeSet, err
+		}
+		changeSet.Append(cs.Entries)
+
+		if err := m.WaitForSet(cs.ToObjMetadataSet(), WaitOptions{Interval: opts.WaitInterval, Timeout: opts.WaitTimeout}); err != nil {
+			return changeSet, err
+		}
+	}
+
+	// Apply custom staged objects next.
+	if len(customStage) > 0 {
+		cs, err := m.ApplyAll(ctx, customStage, opts)
+		if err != nil {
+			return changeSet, err
+		}
+		changeSet.Append(cs.Entries)
+	}
+
+	// Finally, apply all the other resources.
+	cs, err := m.ApplyAll(ctx, resStage, opts)
+	if err != nil {
+		return changeSet, err
+	}
+	changeSet.Append(cs.Entries)
+
+	return changeSet, nil
+}
+
+func (m *ResourceManager) dryRunApply(ctx context.Context, object *unstructured.Unstructured) error {
+	opts := []client.PatchOption{
+		client.DryRunAll,
+		client.ForceOwnership,
+		client.FieldOwner(m.owner.Field),
+	}
+	return m.client.Patch(ctx, object, client.Apply, opts...)
+}
+
+func (m *ResourceManager) apply(ctx context.Context, object *unstructured.Unstructured) error {
+	opts := []client.PatchOption{
+		client.ForceOwnership,
+		client.FieldOwner(m.owner.Field),
+	}
+	return m.client.Patch(ctx, object, client.Apply, opts...)
+}
+
+// migrateAPIVersion rewrites every managed fields entry on existingObject
+// to desiredAPIVersion via a JSON patch. See ApplyOptions.MigrateAPIVersion
+// for the motivation. Every entry is rewritten, regardless of the field
+// manager that owns it or whether it sits on a subresource: any entry
+// left at an older API version can make the next apply fail with "field
+// not declared in schema". On success existingObject is updated in-place
+// with the server's response. Returns whether a patch was actually
+// applied (false means there was nothing to migrate).
+func (m *ResourceManager) migrateAPIVersion(ctx context.Context,
+	existingObject *unstructured.Unstructured,
+	desiredAPIVersion string) (bool, error) {
+
+	// Build patch.
+	patch, err := PatchMigrateToVersion(existingObject, desiredAPIVersion)
+	if err != nil {
+		return false, fmt.Errorf("failed to create patch for migrating managed fields API version: %w", err)
+	}
+	if len(patch) == 0 {
+		return false, nil
+	}
+
+	// Apply patch.
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal patch for migrating managed fields API version: %w", err)
+	}
+	rawPatch := client.RawPatch(types.JSONPatchType, patchBytes)
+	if err := m.client.Patch(ctx, existingObject, rawPatch, client.FieldOwner(m.owner.Field)); err != nil {
+		return false, fmt.Errorf("failed to migrate managed fields API version to %s: %w", desiredAPIVersion, err)
+	}
+
+	return true, nil
+}
+
+// cleanupMetadata performs an HTTP PATCH request to remove entries
+// from metadata annotations, labels and managedFields. It updates
+// object in-place with the server's response.
+func (m *ResourceManager) cleanupMetadata(ctx context.Context,
+	desiredObject *unstructured.Unstructured,
+	object *unstructured.Unstructured,
+	opts ApplyCleanupOptions) (bool, error) {
+	if utils.AnyInMetadata(desiredObject, opts.Exclusions) || utils.AnyInMetadata(object, opts.Exclusions) {
+		return false, nil
+	}
+
+	if object == nil {
+		return false, nil
+	}
+	var patches []JSONPatch
+
+	if len(opts.Annotations) > 0 {
+		patches = append(patches, PatchRemoveAnnotations(object, opts.Annotations)...)
+	}
+
+	if len(opts.Labels) > 0 {
+		patches = append(patches, PatchRemoveLabels(object, opts.Labels)...)
+	}
+
+	if len(opts.FieldManagers) > 0 {
+		managedFieldPatch, err := PatchReplaceFieldsManagers(object, opts.FieldManagers, m.owner.Field)
+		if err != nil {
+			return false, err
+		}
+		patches = append(patches, managedFieldPatch...)
+	}
+
+	// no patching is needed exit early
+	if len(patches) == 0 {
+		return false, nil
+	}
+
+	rawPatch, err := json.Marshal(patches)
+	if err != nil {
+		return false, err
+	}
+	patch := client.RawPatch(types.JSONPatchType, rawPatch)
+
+	return true, m.client.Patch(ctx, object, patch, client.FieldOwner(m.owner.Field))
+}
+
+// shouldForceApply determines based on the apply error and ApplyOptions if the object should be recreated.
+// An object is recreated if the apply error was due to immutable field changes and if the object
+// contains a label or annotation which matches the ApplyOptions.ForceSelector.
+func (m *ResourceManager) shouldForceApply(desiredObject *unstructured.Unstructured,
+	existingObject *unstructured.Unstructured, opts ApplyOptions, err error) bool {
+	if ssaerrors.IsImmutableError(err) {
+		if opts.Force ||
+			utils.AnyInMetadata(desiredObject, opts.ForceSelector) ||
+			(existingObject != nil && utils.AnyInMetadata(existingObject, opts.ForceSelector)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// shouldSkipApply determines based on the object metadata and ApplyOptions if the object should be skipped.
+// An object is not applied if it contains a label or annotation
+// which matches the ApplyOptions.ExclusionSelector or ApplyOptions.IfNotPresentSelector.
+// When the object is skipped, a ChangeSetEntry built from the existing in-cluster object
+// is returned if the object exists (UID is set), otherwise from the desired object.
+// Preferring the existing object keeps the entry metadata stable across reconciliations,
+// e.g. for cluster-scoped resources whose desired metadata may carry a namespace
+// injected by upstream tooling that the API server strips on apply.
+func (m *ResourceManager) shouldSkipApply(desiredObject *unstructured.Unstructured,
+	existingObject *unstructured.Unstructured, opts ApplyOptions) (bool, *ChangeSetEntry) {
+	source := desiredObject
+	if existingObject.GetUID() != "" {
+		source = existingObject
+	}
+
+	if utils.AnyInMetadata(desiredObject, opts.ExclusionSelector) ||
+		utils.AnyInMetadata(existingObject, opts.ExclusionSelector) {
+		return true, m.changeSetEntry(source, SkippedAction)
+	}
+
+	if existingObject.GetUID() != "" &&
+		utils.AnyInMetadata(desiredObject, opts.IfNotPresentSelector) {
+		return true, m.changeSetEntry(source, SkippedAction)
+	}
+
+	return false, nil
+}
+
+// removeIgnoredFields removes the fields matched by the given pre-compiled
+// ignore rules from obj. Selectors are evaluated against matchObj so that
+// existing and dry-run copies are stripped based on the same decision.
+func removeIgnoredFields(matchObj, obj *unstructured.Unstructured, rules jsondiff.CompiledIgnoreRules) error {
+	var ignorePaths jsondiff.IgnorePaths
+	for sr, paths := range rules {
+		if sr.MatchUnstructured(matchObj) {
+			ignorePaths = append(ignorePaths, paths...)
+		}
+	}
+
+	if len(ignorePaths) > 0 {
+		patch := jsondiff.GenerateRemovePatch(ignorePaths...)
+		if err := jsondiff.ApplyPatchToUnstructured(obj, patch); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// lookupJSONPointer resolves an RFC 6901 JSON pointer against the unstructured
+// object's content. A missing path is reported as (nil, false, nil).
+func lookupJSONPointer(obj *unstructured.Unstructured, pointer string) (any, bool, error) {
+	ptr, err := jsonpointer.New(pointer)
+	if err != nil {
+		return nil, false, err
+	}
+	val, _, err := ptr.Get(obj.Object)
+	if err != nil {
+		// jsonpointer returns an error when any segment of the pointer cannot
+		// be resolved; treat that as "not present" rather than a hard failure.
+		return nil, false, nil
+	}
+	return val, true, nil
+}
+
+// driftAction describes what to do with a drifted ignored path.
+type driftAction int
+
+const (
+	// driftStrip removes the field from the payload. Used when another
+	// Apply manager owns the field.
+	driftStrip driftAction = iota
+	// driftAdopt replaces the field in the payload with the in-cluster
+	// value. Used when Flux is the sole owner.
+	driftAdopt
+)
+
+// driftEntry holds the resolution for a single drifted ignored path.
+type driftEntry struct {
+	path   string
+	action driftAction
+	value  any // in-cluster value; set only when action == driftAdopt
+}
+
+// driftResult holds all drift resolutions for a single object.
+type driftResult struct {
+	entries []driftEntry
+}
+
+// applyDriftResult applies strip and adopt operations to the payload.
+func applyDriftResult(target *unstructured.Unstructured, dr driftResult) error {
+	var stripPaths jsondiff.IgnorePaths
+	var adoptOps []jsondiff.ReplaceOp
+	for _, e := range dr.entries {
+		switch e.action {
+		case driftStrip:
+			stripPaths = append(stripPaths, e.path)
+		case driftAdopt:
+			adoptOps = append(adoptOps, jsondiff.ReplaceOp{
+				Path:  e.path,
+				Value: e.value,
+			})
+		}
+	}
+	if len(stripPaths) > 0 {
+		patch := jsondiff.GenerateRemovePatch(stripPaths...)
+		if err := jsondiff.ApplyPatchToUnstructured(target, patch); err != nil {
+			return err
+		}
+	}
+	if len(adoptOps) > 0 {
+		patch := jsondiff.GenerateReplacePatch(adoptOps...)
+		if err := jsondiff.ApplyPatchToUnstructured(target, patch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// computeDriftedPaths returns the drift resolution for each ignored path whose
+// values differ between existingObject and dryRunObject. For paths owned by
+// another Apply manager, the action is driftStrip (remove from payload). For
+// paths where Flux is the sole owner, the action is driftAdopt (copy in-cluster
+// value into the payload).
+func computeDriftedPaths(
+	existingObject, dryRunObject *unstructured.Unstructured,
+	rules jsondiff.CompiledIgnoreRules,
+	fluxManager string,
+) driftResult {
+	var result driftResult
+	parsed := parseManagedFieldsApply(existingObject)
+
+	for sr, paths := range rules {
+		if sr.MatchUnstructured(dryRunObject) {
+			for _, path := range paths {
+				existingVal, ef, eerr := lookupJSONPointer(existingObject, path)
+				dryRunVal, df, derr := lookupJSONPointer(dryRunObject, path)
+				if eerr != nil || derr != nil || ef != df ||
+					!apiequality.Semantic.DeepEqual(existingVal, dryRunVal) {
+					if isFieldOwnedByOtherApplyManager(existingObject, path, fluxManager, parsed) {
+						result.entries = append(result.entries, driftEntry{
+							path:   path,
+							action: driftStrip,
+						})
+					} else {
+						result.entries = append(result.entries, driftEntry{
+							path:   path,
+							action: driftAdopt,
+							value:  existingVal,
+						})
+					}
+				}
+			}
+		}
+	}
+	return result
+}
+
+// parsedManagedField holds a pre-parsed Apply managed fields entry.
+type parsedManagedField struct {
+	manager string
+	fields  map[string]any
+}
+
+// parseManagedFieldsApply returns all non-subresource Apply entries with their
+// fieldsV1 pre-parsed into maps. Entries with missing or corrupt fieldsV1 are
+// skipped.
+func parseManagedFieldsApply(obj *unstructured.Unstructured) []parsedManagedField {
+	var result []parsedManagedField
+	for _, mf := range obj.GetManagedFields() {
+		if mf.Subresource != "" || mf.Operation != metav1.ManagedFieldsOperationApply {
+			continue
+		}
+		if mf.FieldsV1 == nil || len(mf.FieldsV1.Raw) == 0 {
+			continue
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(mf.FieldsV1.Raw, &fields); err != nil {
+			continue
+		}
+		result = append(result, parsedManagedField{
+			manager: mf.Manager,
+			fields:  fields,
+		})
+	}
+	return result
+}
+
+// isFieldOwnedByOtherApplyManager checks whether any Apply field manager other
+// than fluxManager owns the given JSON pointer path on the object.
+func isFieldOwnedByOtherApplyManager(
+	obj *unstructured.Unstructured,
+	pointer string,
+	fluxManager string,
+	parsed []parsedManagedField,
+) bool {
+	segments, err := pointerToFieldsV1Segments(obj, pointer, parsed)
+	if err != nil {
+		// Cannot resolve path in fieldsV1 — treat as sole owner (adopt).
+		return false
+	}
+	for _, entry := range parsed {
+		if entry.manager == fluxManager {
+			continue
+		}
+		if fieldsV1Contains(entry.fields, segments) {
+			return true
+		}
+	}
+	return false
+}
+
+// pointerToFieldsV1Segments converts a JSON pointer (e.g., "/spec/replicas")
+// into fieldsV1 traversal segments (e.g., ["f:spec", "f:replicas"]).
+// For array-indexed segments, it resolves the k:{...} key by matching the item
+// at the given index against k: entries in the parsed managed fields.
+func pointerToFieldsV1Segments(
+	obj *unstructured.Unstructured,
+	pointer string,
+	parsed []parsedManagedField,
+) ([]string, error) {
+	raw := strings.TrimPrefix(pointer, "/")
+	if raw == "" {
+		return nil, fmt.Errorf("empty pointer")
+	}
+
+	// Split and unescape RFC 6901 segments.
+	rawSegments := strings.Split(raw, "/")
+	for i, s := range rawSegments {
+		s = strings.ReplaceAll(s, "~1", "/")
+		s = strings.ReplaceAll(s, "~0", "~")
+		rawSegments[i] = s
+	}
+
+	var segments []string
+	// objPath tracks the raw field names for lookups into obj.Object.
+	var objPath []string
+
+	for i, seg := range rawSegments {
+		idx, err := strconv.Atoi(seg)
+		if err != nil {
+			// Regular field — prefix with f:
+			segments = append(segments, "f:"+seg)
+			objPath = append(objPath, seg)
+			continue
+		}
+
+		// Numeric index — resolve k:{...} from fieldsV1.
+		kKey, err := resolveArrayMergeKey(obj, objPath, idx, segments, parsed)
+		if err != nil {
+			return nil, fmt.Errorf("cannot resolve array key for %s[%d]: %w",
+				strings.Join(rawSegments[:i], "/"), idx, err)
+		}
+		segments = append(segments, kKey)
+		// Advance objPath with the numeric index for subsequent lookups.
+		objPath = append(objPath, seg)
+	}
+	return segments, nil
+}
+
+// resolveArrayMergeKey finds the k:{...} fieldsV1 key that matches the array
+// item at the given index. It inspects k: entries from the parsed managed
+// fields at the given parent path, then matches each against the item's fields
+// in the actual object.
+func resolveArrayMergeKey(
+	obj *unstructured.Unstructured,
+	objPath []string,
+	index int,
+	fieldsV1ParentSegments []string,
+	parsed []parsedManagedField,
+) (string, error) {
+	// Get the array and item from the actual object.
+	arr, found, _ := unstructured.NestedSlice(obj.Object, objPath...)
+	if !found || index >= len(arr) {
+		return "", fmt.Errorf("array not found or index %d out of bounds", index)
+	}
+	item, ok := arr[index].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("array item at index %d is not a map", index)
+	}
+
+	// Collect all k:{...} keys from every managed fields entry at the parent.
+	kKeys := collectKKeys(fieldsV1ParentSegments, parsed)
+	if len(kKeys) == 0 {
+		return "", fmt.Errorf("no k: entries found at parent path")
+	}
+
+	// Find the k:{...} key whose key-value pairs all match the item.
+	for _, kKey := range kKeys {
+		kv, err := parseKKey(kKey)
+		if err != nil {
+			continue
+		}
+		if matchesKKey(item, kv) {
+			return kKey, nil
+		}
+	}
+	return "", fmt.Errorf("no matching k: entry for item at index %d", index)
+}
+
+// collectKKeys walks all parsed managed field entries to the given parent
+// segments and returns all unique k:{...} keys found at that level.
+func collectKKeys(parentSegments []string, parsed []parsedManagedField) []string {
+	seen := map[string]struct{}{}
+	for _, entry := range parsed {
+		node := walkFieldsV1(entry.fields, parentSegments)
+		if node == nil {
+			continue
+		}
+		for key := range node {
+			if strings.HasPrefix(key, "k:") {
+				if _, ok := seen[key]; !ok {
+					seen[key] = struct{}{}
+				}
+			}
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// parseKKey parses a k:{...} fieldsV1 key into its key-value pairs.
+func parseKKey(kKey string) (map[string]any, error) {
+	var kv map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(kKey, "k:")), &kv); err != nil {
+		return nil, err
+	}
+	return kv, nil
+}
+
+// matchesKKey checks if all key-value pairs in kv exist with equal values in item.
+func matchesKKey(item, kv map[string]any) bool {
+	for k, v := range kv {
+		if !apiequality.Semantic.DeepEqual(item[k], v) {
+			return false
+		}
+	}
+	return true
+}
+
+// walkFieldsV1 traverses a parsed fieldsV1 map following the given segments.
+// Returns the node at the end of the path, or nil if any segment is missing.
+func walkFieldsV1(fields map[string]any, segments []string) map[string]any {
+	current := fields
+	for _, seg := range segments {
+		child, ok := current[seg]
+		if !ok {
+			return nil
+		}
+		childMap, ok := child.(map[string]any)
+		if !ok {
+			return nil
+		}
+		current = childMap
+	}
+	return current
+}
+
+// fieldsV1Contains walks a parsed fieldsV1 map to check if the given segments
+// path exists.
+func fieldsV1Contains(fields map[string]any, segments []string) bool {
+	if len(segments) == 0 {
+		return false
+	}
+	current := fields
+	for i, seg := range segments {
+		child, ok := current[seg]
+		if !ok {
+			return false
+		}
+		// Last segment: existence is enough (leaf may be empty map).
+		if i == len(segments)-1 {
+			return true
+		}
+		childMap, ok := child.(map[string]any)
+		if !ok {
+			return false
+		}
+		current = childMap
+	}
+	return true
+}
+
+// hasDriftedWithIgnore is like hasDrifted but strips ignored fields from deep
+// copies before comparing. If compiled is nil, it falls back to hasDrifted.
+// Selector matching is done against dryRunObject so both copies are stripped
+// on the same decision, matching computeDriftedPaths.
+func (m *ResourceManager) hasDriftedWithIgnore(
+	existingObject, dryRunObject *unstructured.Unstructured,
+	compiled jsondiff.CompiledIgnoreRules,
+) (bool, error) {
+	if compiled == nil {
+		return m.hasDrifted(existingObject, dryRunObject), nil
+	}
+	existingCopy := existingObject.DeepCopy()
+	dryRunCopy := dryRunObject.DeepCopy()
+	if err := removeIgnoredFields(dryRunObject, existingCopy, compiled); err != nil {
+		return false, err
+	}
+	if err := removeIgnoredFields(dryRunObject, dryRunCopy, compiled); err != nil {
+		return false, err
+	}
+	return m.hasDrifted(existingCopy, dryRunCopy), nil
+}

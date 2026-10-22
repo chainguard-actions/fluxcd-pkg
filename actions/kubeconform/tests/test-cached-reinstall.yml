@@ -1,0 +1,33 @@
+name: Test cached reinstall
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: first
+        uses: .
+        with:
+          version: v0.6.7
+      - name: Record binary mtime
+        run: |
+          P="$(which kubeconform)"
+          echo "path: $P"
+          stat -c %Y "$P" > /tmp/mtime1
+      - id: second
+        uses: .
+        with:
+          version: v0.6.7
+      - name: Assert binary reused from cache
+        run: |
+          P="$(which kubeconform)"
+          M1="$(cat /tmp/mtime1)"
+          M2="$(stat -c %Y "$P")"
+          echo "mtime1=$M1 mtime2=$M2"
+          kubeconform -v
+          if [ "$M1" != "$M2" ]; then
+            echo "FAIL: binary was re-downloaded"
+            exit 1
+          fi
+          echo "PASS"

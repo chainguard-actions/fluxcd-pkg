@@ -1,0 +1,38 @@
+name: Test cached reinstall
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: first
+        uses: .
+        with:
+          version: 3.9.0
+      - name: Record binary mtime
+        id: mtime
+        run: |
+          F="$(ls "$RUNNER_TOOL_CACHE"/sops/v3.9.0/linux/*/sops | head -n1)"
+          echo "file: $F"
+          echo "mtime=$(stat -c %Y "$F")" >> "$GITHUB_OUTPUT"
+          echo "file=$F" >> "$GITHUB_OUTPUT"
+      - id: second
+        uses: .
+        with:
+          version: 3.9.0
+      - name: Assert cached binary reused
+        env:
+          BEFORE: ${{ steps.mtime.outputs.mtime }}
+          FILE: ${{ steps.mtime.outputs.file }}
+        run: |
+          AFTER="$(stat -c %Y "$FILE")"
+          echo "before: $BEFORE after: $AFTER"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "FAIL: binary was re-downloaded instead of reused from cache"
+            exit 1
+          fi
+          OUT="$(sops --version --disable-version-check 2>&1 || sops --version 2>&1)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "3.9.0" || { echo "FAIL: wrong version"; exit 1; }
+          echo "PASS"

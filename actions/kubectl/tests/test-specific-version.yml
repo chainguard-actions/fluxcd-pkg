@@ -1,0 +1,26 @@
+name: Test specific version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v1.30.0
+      - name: Assert kubectl installed at requested version
+        run: |
+          which kubectl
+          OUT="$(kubectl version --client 2>&1)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "v1.30.0"; then
+            echo "FAIL: expected kubectl v1.30.0"
+            exit 1
+          fi
+          case "$(which kubectl)" in
+            */kubectl/v1.30.0/linux/*) echo "PASS: path in tool cache" ;;
+            *) echo "FAIL: kubectl not from tool cache dir"; exit 1 ;;
+          esac
+          echo "PASS"

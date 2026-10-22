@@ -1,0 +1,43 @@
+name: Test cached reinstall
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: first
+        uses: .
+        with:
+          version: v4.44.3
+      - name: Record binary path
+        run: |
+          BIN="$(command -v yq)"
+          echo "bin: $BIN"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+      - id: second
+        uses: .
+        with:
+          version: v4.44.3
+      - name: Assert second install into existing tool dir succeeded
+        run: |
+          NEW_BIN="$(command -v yq)"
+          echo "first bin: $BIN"
+          echo "second bin: $NEW_BIN"
+          if [ "$NEW_BIN" != "$BIN" ]; then
+            echo "FAIL: binary path changed between installs"
+            exit 1
+          fi
+          case "$NEW_BIN" in
+            */yq/v4.44.3/linux/*/yq) ;;
+            *) echo "FAIL: unexpected install path"; exit 1 ;;
+          esac
+          if [ ! -x "$NEW_BIN" ]; then
+            echo "FAIL: binary not executable"
+            exit 1
+          fi
+          OUT="$(yq --version)"
+          echo "version: $OUT"
+          echo "$OUT" | grep -q "v4.44.3" || { echo "FAIL: wrong version"; exit 1; }
+          echo 'a: 1' | yq '.a' | grep -qx 1 || { echo "FAIL: yq not functional"; exit 1; }
+          echo "PASS"

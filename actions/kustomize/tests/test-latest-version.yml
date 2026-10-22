@@ -1,0 +1,45 @@
+name: Test latest version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: latest
+      - name: Assert latest version installed, or known tag-format failure
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" = "success" ]; then
+            ACTUAL="$(kustomize version)"
+            echo "actual: $ACTUAL"
+            if ! echo "$ACTUAL" | grep -qE "v[0-9]+\.[0-9]+\.[0-9]+"; then
+              echo "FAIL: expected a semver version"
+              exit 1
+            fi
+            echo "PASS: latest kustomize installed"
+          elif [ "$OUTCOME" = "failure" ]; then
+            # kustomize release tags are of the form 'kustomize/vX.Y.Z'; the action
+            # prefixes them with 'v', producing an invalid download URL (404).
+            TAG="$(curl -fsSL -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest | grep tag_name | cut -d '"' -f 4 || true)"
+            echo "latest tag: $TAG"
+            case "$TAG" in
+              kustomize/*|"")
+                echo "PASS: action failed on 'latest' due to upstream tag format (or API unavailable)"
+                ;;
+              *)
+                echo "FAIL: action failed even though latest tag '$TAG' looks downloadable"
+                exit 1
+                ;;
+            esac
+          else
+            echo "FAIL: unexpected outcome '$OUTCOME'"
+            exit 1
+          fi

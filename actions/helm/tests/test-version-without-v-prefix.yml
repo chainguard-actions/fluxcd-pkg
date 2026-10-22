@@ -1,0 +1,36 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Pre-add helm tool dir to PATH (installer verifies helm is on PATH)
+        run: |
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          D="${RUNNER_TOOL_CACHE}/helm/v3.13.3/linux/${ARCH}"
+          mkdir -p "$D"
+          echo "$D" >> "$GITHUB_PATH"
+      - id: action
+        uses: .
+        with:
+          version: 3.13.3
+      - name: Assert helm v3.13.3 installed
+        run: |
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          case "$ACTUAL" in
+            v3.13.3*) echo "PASS" ;;
+            *) echo "FAIL: expected v3.13.3"; exit 1 ;;
+          esac
+      - name: Assert tool cache dir uses v-prefixed version
+        run: |
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          F="${RUNNER_TOOL_CACHE}/helm/v3.13.3/linux/${ARCH}/helm"
+          echo "checking $F"
+          if [ ! -x "$F" ]; then
+            echo "FAIL: helm not found at normalized tool cache path"
+            exit 1
+          fi
+          echo "PASS"

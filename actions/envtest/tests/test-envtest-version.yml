@@ -1,0 +1,33 @@
+name: Test explicit envtest version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          envtest_version: release-0.19
+          k8s_version: 1.31.x
+      - name: Assert setup-envtest installed under versioned tool dir
+        run: |
+          P="$(command -v setup-envtest || true)"
+          echo "setup-envtest: $P"
+          case "$P" in
+            */setup-envtest/release-0.19/*) echo "PASS" ;;
+            *) echo "FAIL: expected setup-envtest under release-0.19 tool dir"; exit 1 ;;
+          esac
+      - name: Assert KUBEBUILDER_ASSETS valid
+        run: |
+          ASSETS="${KUBEBUILDER_ASSETS//\'/}"
+          echo "assets: $ASSETS"
+          if [ -z "$ASSETS" ] || [ ! -x "$ASSETS/kube-apiserver" ] || [ ! -x "$ASSETS/etcd" ]; then
+            echo "FAIL: envtest assets missing"
+            exit 1
+          fi
+          case "$ASSETS" in
+            *1.31.*) echo "PASS" ;;
+            *) echo "FAIL: expected 1.31 assets"; exit 1 ;;
+          esac

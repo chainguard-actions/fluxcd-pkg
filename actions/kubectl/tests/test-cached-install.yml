@@ -1,0 +1,33 @@
+name: Test cached install
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: first
+        uses: .
+        with:
+          version: v1.30.0
+      - name: Record binary mtime
+        run: |
+          P="$(which kubectl)"
+          echo "path: $P"
+          stat -c %Y "$P" > /tmp/kubectl-mtime
+      - id: second
+        uses: .
+        with:
+          version: v1.30.0
+      - name: Assert cache reused
+        run: |
+          P="$(which kubectl)"
+          kubectl version --client
+          BEFORE="$(cat /tmp/kubectl-mtime)"
+          AFTER="$(stat -c %Y "$P")"
+          echo "before=$BEFORE after=$AFTER"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "FAIL: binary was re-downloaded"
+            exit 1
+          fi
+          echo "PASS"

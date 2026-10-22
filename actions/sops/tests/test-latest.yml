@@ -1,0 +1,20 @@
+name: Test latest version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+      - name: Assert sops installed
+        run: |
+          which sops || { echo "FAIL: sops not on PATH"; exit 1; }
+          OUT="$(sops --version --disable-version-check 2>&1 || sops --version 2>&1)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -qE "sops [0-9]+\.[0-9]+\.[0-9]+"; then
+            echo "FAIL: unexpected version output"
+            exit 1
+          fi
+          echo "PASS"

@@ -1,0 +1,46 @@
+name: Test basic single CRD
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          crd: tests/fixtures/widget-crd.yaml
+          output: out-basic
+      - name: Assert schema files generated
+        run: |
+          OUT="$GITHUB_WORKSPACE/out-basic"
+          ls -la "$OUT" || { echo "FAIL: output dir missing"; exit 1; }
+          for f in widget-example-v1.json _definitions.json all.json; do
+            if [ ! -s "$OUT/$f" ]; then
+              echo "FAIL: missing $f"
+              exit 1
+            fi
+          done
+          python3 - "$OUT" <<'EOF'
+          import json, sys, os
+          out = sys.argv[1]
+          s = json.load(open(os.path.join(out, "widget-example-v1.json")))
+          print(json.dumps(s, indent=1))
+          assert s["type"] == "object", "type"
+          spec = s["properties"]["spec"]
+          assert spec["type"] == "object", "spec type"
+          assert spec.get("additionalProperties") is False, "spec additionalProperties not set to false"
+          assert s["properties"]["apiVersion"] == {"type": "string"}, "apiVersion"
+          assert s["properties"]["kind"] == {"type": "string"}, "kind"
+          assert spec["properties"]["size"] == {"type": "integer"}, "size"
+          port = spec["properties"]["port"]
+          assert port == {"oneOf": [{"type": "string"}, {"type": "integer"}]}, "int-or-string not replaced: %r" % port
+          d = json.load(open(os.path.join(out, "_definitions.json")))
+          key = "example.com.v1.Widget"
+          assert key in d["definitions"], "definition key missing"
+          assert d["definitions"][key]["properties"]["apiVersion"]["enum"] == ["example.com/v1"]
+          assert d["definitions"][key]["properties"]["kind"]["enum"] == ["Widget"]
+          a = json.load(open(os.path.join(out, "all.json")))
+          assert a == {"oneOf": [{"$ref": "_definitions.json#/definitions/example.com.v1.Widget"}]}, a
+          print("PASS")
+          EOF

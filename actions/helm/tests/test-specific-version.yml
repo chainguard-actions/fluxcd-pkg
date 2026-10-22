@@ -1,0 +1,31 @@
+name: Test specific version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v3.14.0
+      - name: Assert helm v3.14.0 installed and on PATH
+        run: |
+          which helm
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          case "$ACTUAL" in
+            v3.14.0*) echo "PASS" ;;
+            *) echo "FAIL: expected v3.14.0"; exit 1 ;;
+          esac
+      - name: Assert installed in tool cache
+        run: |
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          F="${RUNNER_TOOL_CACHE}/helm/v3.14.0/linux/${ARCH}/helm"
+          echo "checking $F"
+          if [ ! -x "$F" ]; then
+            echo "FAIL: helm not found in tool cache"
+            exit 1
+          fi
+          echo "PASS"

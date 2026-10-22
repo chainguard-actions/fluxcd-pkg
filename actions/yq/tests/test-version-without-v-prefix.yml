@@ -1,0 +1,25 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 4.43.1
+      - name: Assert version normalized with v prefix
+        run: |
+          echo "yq path: $(command -v yq)"
+          OUT="$(yq --version)"
+          echo "version output: $OUT"
+          if ! echo "$OUT" | grep -q "v4.43.1"; then
+            echo "FAIL: expected yq v4.43.1"
+            exit 1
+          fi
+          case "$(command -v yq)" in
+            "$RUNNER_TOOL_CACHE/yq/v4.43.1/"*) echo "PASS" ;;
+            *) echo "FAIL: expected tool dir with v-prefixed version"; exit 1 ;;
+          esac
