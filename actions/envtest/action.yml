@@ -17,7 +17,7 @@ runs:
   using: composite
   steps:
     - name: Setup Go
-      uses: actions/setup-go@4d34df0c2316fe8122ab82dc22947d607c0c91f9 # v4.0.0
+      uses: chainguard-actions/actions-setup-go@9b832917129506b9220e9efeac7b50ae98907031 # v4.0.0
       with:
         go-version: 1.26.x
         cache: false
