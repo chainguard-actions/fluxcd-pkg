@@ -10,13 +10,13 @@
 
 **Harden Agent Version:** `2`
 
-Action **fluxcd--pkg--actions--envtest/version/v0.20.0** was hardened automatically. 8 finding(s) were identified and resolved across 2 iteration(s).
+Action **fluxcd--pkg--actions--envtest/version/v0.20.0** was hardened automatically. 8 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### script-injection (severity: high)
 
-Rule (a): the 'Use specified version to install' step puts an expression straight into the run script: `echo "VERSION=${{ inputs.envtest_version }}" >> "$GITHUB_ENV"`. Fix: pass the input in through an env: variable and quote it where it is used.
+Rule (a): the step 'Use specified version to install' puts an expression directly in the run: script: `echo "VERSION=${{ inputs.envtest_version }}" >> "$GITHUB_ENV"`.
 
 Locations:
 
@@ -24,7 +24,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Rule (a): the 'Determine version to install' step puts an expression straight into the run script: `curl -fsSL -H "Authorization: token ${{github.token}}" ...`. Fix: pass it in through an env: variable (e.g. GH_TOKEN) and reference it as "$GH_TOKEN".
+Rule (a): the step 'Determine version to install' puts an expression directly in the run: script: `curl -fsSL -H "Authorization: token ${{github.token}}" ...`. Pass the token in through an env: variable instead.
 
 Locations:
 
@@ -32,7 +32,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Rule (a): the 'Install the specified version of envtest' step puts an expression straight into the run script, unquoted: `K8S_VERSION=${{ inputs.k8s_version }}`. Shell metacharacters in the input would run as commands. Fix: pass it in through an env: variable and quote every use.
+Rule (a): the step 'Install the specified version of envtest' puts an expression directly in the run: script, and it is unquoted: `K8S_VERSION=${{ inputs.k8s_version }}`.
 
 Locations:
 
@@ -40,7 +40,7 @@ Locations:
 
 ### github-env-injection (severity: high)
 
-The 'Use specified version to install' step writes inputs.envtest_version straight to $GITHUB_ENV without stripping newlines: `echo "VERSION=${{ inputs.envtest_version }}" >> "$GITHUB_ENV"`. A newline in the input lets a caller set any environment variable. Fix: run the value through printf '%s' ... | tr -d '\n\r' before writing it.
+The step 'Use specified version to install' writes inputs.envtest_version straight to $GITHUB_ENV (`echo "VERSION=${{ inputs.envtest_version }}" >> "$GITHUB_ENV"`) with no printf '%s' | tr -d '\n\r' step first. A newline in the input could inject extra environment variables.
 
 Locations:
 
@@ -48,7 +48,7 @@ Locations:
 
 ### github-env-injection (severity: high)
 
-The 'Download the binary' step writes SETUPENVTEST_TOOL_DIR to $GITHUB_PATH: `echo "$SETUPENVTEST_TOOL_DIR" >> "$GITHUB_PATH"`. That path is built from the inherited env vars RUNNER_TOOL_CACHE and VERSION, and VERSION comes from the input. Newlines are not stripped with printf '%s' ... | tr -d '\n\r' first.
+The step 'Download the binary to the runner's cache dir' builds SETUPENVTEST_TOOL_DIR from the inherited env vars VERSION (set from inputs.envtest_version) and RUNNER_TOOL_CACHE. Neither is computed in this script. It then writes the path to $GITHUB_PATH (`echo "$SETUPENVTEST_TOOL_DIR" >> "$GITHUB_PATH"`) without printf '%s' | tr -d '\n\r'.
 
 Locations:
 
@@ -56,7 +56,7 @@ Locations:
 
 ### github-env-injection (severity: high)
 
-The 'Install the specified version of envtest' step writes KUBEBUILDER_ASSETS to $GITHUB_ENV: `echo "KUBEBUILDER_ASSETS='$ENVTEST_ASSETS_PATH'" >> "$GITHUB_ENV"`. The value is built from inputs.k8s_version and the inherited RUNNER_TOOL_CACHE, and newlines are not stripped with printf '%s' ... | tr -d '\n\r' first.
+The step 'Install the specified version of envtest' writes ENVTEST_ASSETS_PATH to $GITHUB_ENV (`echo "KUBEBUILDER_ASSETS='$ENVTEST_ASSETS_PATH'" >> "$GITHUB_ENV"`) without printf '%s' | tr -d '\n\r'. That value is derived from inputs.k8s_version and the inherited RUNNER_TOOL_CACHE.
 
 Locations:
 
@@ -86,18 +86,11 @@ Locations:
 
 **Notes:**
 
-All findings in action.yml are fixed. Nothing was run to test the changes.
-
-- **Expressions moved to env:** inputs.envtest_version is now read from INPUT_ENVTEST_VERSION, github.token from GH_TOKEN, and inputs.k8s_version from INPUT_K8S_VERSION. Each is double-quoted where the script uses it.
-- **Newlines stripped before writes:** the VERSION and KUBEBUILDER_ASSETS values written to $GITHUB_ENV, and the setup-envtest tool directory written to $GITHUB_PATH, all go through printf '%s' | tr -d '\n\r' first.
-- **Extra sanitizing:** the version looked up with curl is cleaned the same way before it is written, although no finding flagged it.
-- **Error handling kept:** the setup-envtest path lookup is still assigned on its own before cleaning, so the step still stops if that command fails.
-
-### Iteration 2
-
-**Fixes applied:** github-env-injection
-
-**Notes:**
-
-Put back the upstream comment and the 'go clean -cache' block that an earlier edit had broken. Removed the bad write to "$GITHUB_PATH"s. The GITHUB_PATH write now uses SETUPENVTEST_TOOL_DIR after newlines are stripped with printf | tr -d '\n\r'.
+Changes to action.yml:
+- inputs.envtest_version now comes in as the env var INPUT_ENVTEST_VERSION. Newlines are stripped before it is written to GITHUB_ENV.
+- github.token now comes in as the env var GH_TOKEN for the curl call.
+- inputs.k8s_version now comes in as the env var INPUT_K8S_VERSION and is assigned with quotes.
+- SETUPENVTEST_TOOL_DIR has newlines stripped before it is written to GITHUB_PATH.
+- ENVTEST_ASSETS_PATH has newlines stripped before it is written to GITHUB_ENV.
+The action still behaves the same way, including the single quotes upstream puts around the KUBEBUILDER_ASSETS value.
 

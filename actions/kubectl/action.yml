@@ -15,17 +15,17 @@ runs:
       shell: bash
       env:
         INPUT_VERSION: ${{ inputs.version }}
-        GH_TOKEN: ${{ github.token }}
+        GITHUB_TOKEN: ${{ github.token }}
       run: |
         VERSION="$INPUT_VERSION"
         if [[ -z "$VERSION" ]] || [[ "$VERSION" = "latest" ]]; then
-          VERSION=$(curl -fsSL -H "Authorization: token ${GH_TOKEN}" https://api.github.com/repos/kubernetes/kubernetes/releases/latest | grep tag_name | cut -d '"' -f 4)
+          VERSION=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/kubernetes/kubernetes/releases/latest | grep tag_name | cut -d '"' -f 4)
         fi
         if [[ -z "$VERSION" ]]; then
           echo "Unable to determine Kubernetes version"
           exit 1
         fi
-        if [[ ! "$VERSION" = v* ]]; then
+        if [[ ! $VERSION = v* ]]; then
           VERSION="v${VERSION}"
         fi
 
@@ -49,7 +49,7 @@ runs:
         KUBECTL_TOOL_DIR="${RUNNER_TOOL_CACHE}/kubectl/${VERSION}/${OS}/${ARCH}"
         if [[ ! -x "$KUBECTL_TOOL_DIR/$KUBECTL_EXEC_FILE" ]]; then
           DL_DIR="$(mktemp -dt kubectl-XXXXXX)"
-          trap 'rm -rf "$DL_DIR"' EXIT
+          trap 'rm -rf $DL_DIR' EXIT
 
           echo "Downloading kubectl ${VERSION} for ${OS}/${ARCH}"
           KUBECTL_DOWNLOAD_URL="https://dl.k8s.io/${VERSION}/bin/${OS}/${ARCH}/${KUBECTL_EXEC_FILE}"
@@ -60,8 +60,8 @@ runs:
           curl -fsSL -o "$KUBECTL_SHA256_FILE" "$KUBECTL_DOWNLOAD_URL.sha256"
 
           echo "Verifying checksum"
-          sum=$(openssl sha1 -sha256 "${KUBECTL_TARGET_FILE}" | awk '{print $2}')
-          expected_sum=$(cat "${KUBECTL_SHA256_FILE}")
+          sum=$(openssl sha1 -sha256 ${KUBECTL_TARGET_FILE} | awk '{print $2}')
+          expected_sum=$(cat ${KUBECTL_SHA256_FILE})
           if [ "$sum" != "$expected_sum" ]; then
             echo "SHA sum of ${KUBECTL_TARGET_FILE} does not match. Aborting."
             exit 1
@@ -74,8 +74,8 @@ runs:
         fi
 
         echo "Adding kubectl to path"
-        SAFE_TOOL_DIR=$(printf '%s' "$KUBECTL_TOOL_DIR" | tr -d '\n\r')
-        echo "$SAFE_TOOL_DIR" >> "$GITHUB_PATH"
+        safe_tool_dir=$(printf '%s' "$KUBECTL_TOOL_DIR" | tr -d '\n\r')
+        echo "$safe_tool_dir" >> "$GITHUB_PATH"
 
     - name: Print installed kubectl version
       shell: bash

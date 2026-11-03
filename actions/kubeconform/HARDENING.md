@@ -16,7 +16,7 @@ Action **fluxcd--pkg--actions--kubeconform/version/v0.20.0** was hardened automa
 
 ### script-injection (severity: high)
 
-Rule (a): GitHub Actions expressions are pasted straight into the composite run: script. Line 17 has `VERSION=${{ inputs.version }}`, which is unquoted. A caller-supplied version string such as `1; malicious-cmd` would run as shell code. Line 19 has `curl -fsSL -H "Authorization: token ${{github.token}}" ...`, another expression inside run:. Rule (b): on line 25 the input-derived value is expanded without quotes, in `[[ ! $VERSION = v* ]]`. Fix: pass inputs.version and github.token in through env: (for example INPUT_VERSION and GH_TOKEN), and use them only as double-quoted "$INPUT_VERSION" / "$GH_TOKEN".
+Sub-rule (a): expressions are pasted straight into the run: script of step 'Download the binary to the runner's cache dir'. Line 17: `VERSION=${{ inputs.version }}`. This is unquoted, so an attacker-controlled input like `1.0; malicious-cmd` would run as shell code. Line 19: `curl -fsSL -H "Authorization: token ${{github.token}}" ...`. Sub-rule (b): line 25 `if [[ ! $VERSION = v* ]]; then` expands the input-derived variable without quotes. Fix: pass inputs.version and github.token through env: variables (e.g. INPUT_VERSION, GH_TOKEN) and always double-quote them when expanded.
 
 Locations:
 
@@ -26,7 +26,7 @@ Locations:
 
 ### github-env-injection (severity: high)
 
-The step writes `echo "$KUBECONFORM_TOOL_DIR" >> "$GITHUB_PATH"` with no sanitization. KUBECONFORM_TOOL_DIR is built from VERSION, which comes from the untrusted inputs.version, and from RUNNER_TOOL_CACHE, which the composite action inherits from the calling environment. A value containing a newline could add arbitrary directories to PATH. Fix: clean the value just before the write, e.g. safe=$(printf '%s' "$KUBECONFORM_TOOL_DIR" | tr -d '\n\r').
+Line 83: `echo "$KUBECONFORM_TOOL_DIR" >> "$GITHUB_PATH"` writes to $GITHUB_PATH without sanitizing first. KUBECONFORM_TOOL_DIR is built from VERSION, which comes from inputs.version, and from the inherited RUNNER_TOOL_CACHE env var. No `printf '%s' ... | tr -d '\n\r'` step runs before the write, so a newline in the value could inject extra PATH entries.
 
 Locations:
 
@@ -44,17 +44,17 @@ Locations:
 
 ### Iteration 1
 
-**Fixes applied:** script-injection, github-env-injection, static-inline-injection
+**Fixes applied:** script-injection, static-inline-injection, github-env-injection
 
 **Notes:**
 
-In action.yml, inputs.version and github.token now come in through env: as INPUT_VERSION and GH_TOKEN. They are used only as double-quoted variables. The check `[[ ! $VERSION = v* ]]` now quotes its variable. Newlines and carriage returns are stripped from the tool dir before it is written to GITHUB_PATH.
+Moved inputs.version and github.token into the step's env: block as INPUT_VERSION and GH_TOKEN, and referenced them as quoted shell variables. Quoted $VERSION in the v* check. The tool dir now has newlines stripped with printf | tr -d '\n\r' before it's written to $GITHUB_PATH.
 
 ### Iteration 2
 
-**Fixes applied:** script-injection
+**Fixes applied:** github-env-injection
 
 **Notes:**
 
-In action.yml, line 25 was a corrupted line with an unmatched double quote. I put back the intended `echo "Unable to determine kubeconform version"` and indented `exit 1` correctly. On line 28 I quoted `$VERSION` inside the `[[ ]]` test. I also quoted `$KUBECONFORM_EXEC_FILE` in the tar command. It holds a single fixed filename, so quoting it doesn't change how the command behaves.
+Repaired the damaged lines at the end of the download step: put back the truncated `chmod +x "$KUBECONFORM_TOOL_DIR/$KUBECONFORM_EXEC_FILE"`, the missing closing `fi` and the `echo "Adding kubeconform to path"` line. Removed the unsanitized write to GITHUB_PATH. The tool dir is now cleaned with `printf '%s' | tr -d '\n\r'`, saved as SAFE_TOOL_DIR, and only that value is written to $GITHUB_PATH. Writing a plain value (no command substitution inside another call) keeps errexit behavior the same.
 

@@ -60,7 +60,7 @@ runs:
 
         echo "Adding Helm to path"
         SAFE_HELM_TOOL_DIR=$(printf '%s' "$HELM_TOOL_DIR" | tr -d '\n\r')
-        printf '%s\n' "$SAFE_HELM_TOOL_DIR" >> "$GITHUB_PATH"
+        echo "$SAFE_HELM_TOOL_DIR" >> "$GITHUB_PATH"
 
     - name: Print installed Helm version
       shell: bash

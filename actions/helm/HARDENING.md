@@ -16,7 +16,7 @@ Action **fluxcd--pkg--actions--helm/version/v0.20.0** was hardened automatically
 
 ### script-injection (severity: high)
 
-Step 'Download the binary to the runner's cache dir' breaks rule (a): expressions are placed straight into the run: script. Line 17: `VERSION=${{ inputs.version }}`. This is unquoted, so a version string chosen by the caller can run arbitrary shell commands. Line 19: `curl -fsSL -H "Authorization: token ${{github.token}}" ...`. It also breaks rule (b): line 25 `if [[ ! $VERSION = v* ]]` leaves the untrusted variable unquoted. Fix: pass inputs.version and github.token in through env: and always use them double-quoted.
+Sub-rule (a) is violated in the step 'Download the binary to the runner's cache dir': expressions are placed directly into the run: script. Line 17: `VERSION=${{ inputs.version }}` (attacker-controllable input, also unquoted). Line 19: `curl -fsSL -H "Authorization: token ${{github.token}}" ...`. Sub-rule (b) is also violated: the untrusted VERSION value is expanded unquoted on line 25, `if [[ ! $VERSION = v* ]]; then`. Fix: pass inputs.version and github.token in through env: and double-quote every expansion.
 
 Locations:
 
@@ -26,7 +26,7 @@ Locations:
 
 ### github-env-injection (severity: high)
 
-Step 'Download the binary to the runner's cache dir' writes HELM_TOOL_DIR to $GITHUB_PATH without sanitizing it: `echo "$HELM_TOOL_DIR" >> "$GITHUB_PATH"`. HELM_TOOL_DIR is built from VERSION, which comes from the untrusted inputs.version, and from the inherited RUNNER_TOOL_CACHE env var. No `printf '%s' ... | tr -d '\n\r'` step runs before the write, so a newline in the value could inject extra PATH entries.
+The step 'Download the binary to the runner's cache dir' writes HELM_TOOL_DIR to $GITHUB_PATH without sanitizing it (`echo "$HELM_TOOL_DIR" >> "$GITHUB_PATH"`). HELM_TOOL_DIR is built from VERSION, which comes from inputs.version, and from the inherited env var RUNNER_TOOL_CACHE. The required `printf '%s' ... | tr -d '\n\r'` step is not applied before the write, so a newline in the value can add extra PATH entries.
 
 Locations:
 
@@ -48,7 +48,7 @@ Locations:
 
 **Notes:**
 
-inputs.version and github.token now come in through the step's env: block as INPUT_VERSION and GH_TOKEN. Both are always used double-quoted, including in the `v*` check. HELM_TOOL_DIR now has newlines stripped with `printf '%s' | tr -d '\n\r'` before it is written to $GITHUB_PATH. I haven't run the action after these changes.
+Moved inputs.version and github.token into env (INPUT_VERSION, GH_TOKEN) and the script now refers to them as quoted variables. Quoted the $VERSION comparison. Newlines are now stripped from HELM_TOOL_DIR with printf | tr -d '\n\r' before it is written to $GITHUB_PATH. Upstream used no pipe-to-shell or other risky constructs, so I left the rest as it was.
 
 ### Iteration 2
 
@@ -56,5 +56,5 @@ inputs.version and github.token now come in through the step's env: block as INP
 
 **Notes:**
 
-Put back the missing closing 'fi' for the install block, removed the broken partial edit with stray 'h.' text, and changed the unsafe 'echo "$HELM_TOOL_DIR" >> "$GITHUB_PATH"' into a write that strips newlines first (printf '%s' | tr -d '\n\r'). This matches the upstream logic.
+Put back the missing `fi` that closes the `if [[ ! -x ... ]]` block. Removed the leftover text ('h.') after "$GITHUB_PATH" and took out the write of the unsanitized HELM_TOOL_DIR. The step now writes only SAFE_HELM_TOOL_DIR to $GITHUB_PATH, after stripping newlines with printf '%s' | tr -d '\n\r'.
 

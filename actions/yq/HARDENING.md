@@ -10,13 +10,13 @@
 
 **Harden Agent Version:** `2`
 
-Action **fluxcd--pkg--actions--yq/version/v0.20.0** was hardened automatically. 3 finding(s) were identified and resolved across 2 iteration(s).
+Action **fluxcd--pkg--actions--yq/version/v0.20.0** was hardened automatically. 3 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### script-injection (severity: high)
 
-Rule (a): expressions are placed directly inside the run: script of the 'Download the binary to the runner's cache dir' step. Line 17: `VERSION=${{ inputs.version }}`. The caller controls inputs.version, and the expression is substituted into the script before bash parses it, so a value like `1; malicious_cmd` runs as a command. Line 19: `curl -fsSL -H "Authorization: token ${{github.token}}" ...` also interpolates an expression directly. Rule (b): line 25 `[[ ! $VERSION = v* ]]` expands the untrusted VERSION without double quotes. Fix: pass the values through env: entries (e.g. INPUT_VERSION: ${{ inputs.version }}, GH_TOKEN: ${{ github.token }}) and refer to them in double quotes ("$INPUT_VERSION", "$GH_TOKEN").
+Rule (a), expression placed directly in the script: the composite step's run: block puts expressions straight into the shell script. Line 17: `VERSION=${{ inputs.version }}`. The input is substituted into the script before bash runs, so a caller-supplied value like `1; malicious_cmd` gets executed. Line 19: `curl -fsSL -H "Authorization: token ${{github.token}}" ...` also puts an expression in run:. Both should go through env: variables (e.g. INPUT_VERSION, GH_TOKEN) and be used double-quoted. Rule (b), unquoted variable: line 25 `if [[ ! $VERSION = v* ]]; then` uses the input-derived VERSION without quotes. It should read "$VERSION".
 
 Locations:
 
@@ -26,7 +26,7 @@ Locations:
 
 ### github-env-injection (severity: high)
 
-`echo "$YQ_TOOL_DIR" >> "$GITHUB_PATH"` writes a value built from untrusted data without sanitizing it. YQ_TOOL_DIR is made from VERSION, which comes from inputs.version or the GitHub API response, and from the inherited RUNNER_TOOL_CACHE environment variable. The required `printf '%s' ... | tr -d '\n\r'` step is missing, so newlines in the value could add extra entries to PATH. Fix: `safe=$(printf '%s' "$YQ_TOOL_DIR" | tr -d '\n\r'); echo "$safe" >> "$GITHUB_PATH"`.
+Line 79, `echo "$YQ_TOOL_DIR" >> "$GITHUB_PATH"`, writes YQ_TOOL_DIR to $GITHUB_PATH without the required `printf '%s' ... | tr -d '\n\r'` step. YQ_TOOL_DIR is built from the untrusted inputs.version value (VERSION) and the inherited RUNNER_TOOL_CACHE variable. A value with an embedded newline could add arbitrary directories to PATH for later steps.
 
 Locations:
 
@@ -48,13 +48,5 @@ Locations:
 
 **Notes:**
 
-Moved inputs.version and github.token into env (INPUT_VERSION, GH_TOKEN) and referenced them quoted; quoted $VERSION in the [[ ]] test; YQ_TOOL_DIR is stripped of CR/LF before it is written to $GITHUB_PATH.
-
-### Iteration 2
-
-**Fixes applied:** github-env-injection
-
-**Notes:**
-
-action.yml: the version input now has newlines stripped as soon as it is read (printf | tr -d '\n\r'), so the install directory matches the path that gets written. YQ_TOOL_DIR is also cleaned into $safe before it is written to $GITHUB_PATH. Nothing else changed.
+Moved inputs.version and github.token out of the script into the step's env: block (INPUT_VERSION, GH_TOKEN), and quoted $VERSION in the v* test. The value written to $GITHUB_PATH now has \n and \r stripped (printf/tr) before it is written.
 

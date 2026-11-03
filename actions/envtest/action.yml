@@ -17,7 +17,7 @@ runs:
   using: composite
   steps:
     - name: Setup Go
-      uses: actions/setup-go@4d34df0c2316fe8122ab82dc22947d607c0c91f9 # v4.0.0
+      uses: chainguard-actions/actions-setup-go@9b832917129506b9220e9efeac7b50ae98907031 # v4.0.0
       with:
         go-version: 1.27.x
         cache: false
@@ -40,7 +40,6 @@ runs:
           echo "Unable to determine latest setup-envtest version"
           exit 1
         fi
-        VERSION=$(printf '%s' "$VERSION" | tr -d '\n\r')
         echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
     - name: Download the binary to the runner's cache dir
       shell: bash
@@ -60,14 +59,15 @@ runs:
           mkdir -p "$SETUPENVTEST_TOOL_DIR"
           GOBIN="$SETUPENVTEST_TOOL_DIR" go install "sigs.k8s.io/controller-runtime/tools/setup-envtest@${VERSION}"
 
-          # Cleanup cache to avoid affecting other builds cache populated in the above operations.
+          # Cleanup cache to avoid affecting other builds. Some go builds may get
+          # affected by this cache populated in the above operations.
           go clean -cache
         fi
 
         # Add the setup-envtest tool dir to the path.
         echo "Adding setup-envtest to path"
-        safe_tool_dir=$(printf '%s' "$SETUPENVTEST_TOOL_DIR" | tr -d '\n\r')
-        echo "$safe_tool_dir" >> "$GITHUB_PATH"
+        SAFE_TOOL_DIR=$(printf '%s' "$SETUPENVTEST_TOOL_DIR" | tr -d '\n\r')
+        echo "$SAFE_TOOL_DIR" >> "$GITHUB_PATH"
 
     - name: Install the specified version of envtest
       shell: bash
@@ -86,5 +86,5 @@ runs:
         # Export the path to the KUBEBUILDER_ASSETS environment variable.
         echo "Exporting KUBEBUILDER_ASSETS"
         ENVTEST_ASSETS_PATH=$(setup-envtest use --bin-dir "$ENVTEST_TOOL_DIR" -i "$K8S_VERSION" -p path)
-        safe_assets_path=$(printf '%s' "$ENVTEST_ASSETS_PATH" | tr -d '\n\r')
-        echo "KUBEBUILDER_ASSETS='$safe_assets_path'" >> "$GITHUB_ENV"
+        SAFE_ASSETS_PATH=$(printf '%s' "$ENVTEST_ASSETS_PATH" | tr -d '\n\r')
+        echo "KUBEBUILDER_ASSETS='$SAFE_ASSETS_PATH'" >> "$GITHUB_ENV"

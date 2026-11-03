@@ -10,25 +10,22 @@
 
 **Harden Agent Version:** `2`
 
-Action **fluxcd--pkg--actions--kubectl/version/v0.20.0** was hardened automatically. 3 finding(s) were identified and resolved across 2 iteration(s).
+Action **fluxcd--pkg--actions--kubectl/version/v0.20.0** was hardened automatically. 3 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### script-injection (severity: high)
 
-Step 'Download the binary to the runner's cache dir' breaks both sub-rules. (a) A ${{ }} expression is placed directly in the run: script. Line 17 has `VERSION=${{ inputs.version }}`, which an attacker who controls the input can use to run commands. Line 19 has `curl -fsSL -H "Authorization: token ${{github.token}}" ...`. (b) Variables built from the input are expanded without quotes: `[[ ! $VERSION = v* ]]` (line 25), `openssl sha1 -sha256 ${KUBECTL_TARGET_FILE}` (line 60) and `cat ${KUBECTL_SHA256_FILE}` (line 61). The last two paths include VERSION. Fix: pass inputs.version and github.token through env: variables and double-quote every expansion.
+Rule (a), direct expression interpolation in a run: block of the 'Download the binary to the runner's cache dir' step. Line 17: `VERSION=${{ inputs.version }}` puts the input straight into the shell script, unquoted. A crafted version string can run arbitrary commands. Line 19: `curl -fsSL -H "Authorization: token ${{github.token}}" ...` also puts an expression straight into the script. Fix: pass both values through env: (for example INPUT_VERSION and GITHUB_TOKEN) and reference them as "$INPUT_VERSION" and "$GITHUB_TOKEN".
 
 Locations:
 
 - `action.yml:17`
 - `action.yml:19`
-- `action.yml:25`
-- `action.yml:60`
-- `action.yml:61`
 
 ### github-env-injection (severity: high)
 
-Step 'Download the binary to the runner's cache dir' builds KUBECTL_TOOL_DIR from the untrusted inputs.version ("${RUNNER_TOOL_CACHE}/kubectl/${VERSION}/${OS}/${ARCH}") and then runs `echo "$KUBECTL_TOOL_DIR" >> "$GITHUB_PATH"`. There is no `printf '%s' ... | tr -d '\n\r'` sanitization before the write, so newlines in the input can add arbitrary PATH entries.
+Line 74 writes `echo "$KUBECTL_TOOL_DIR" >> "$GITHUB_PATH"`. KUBECTL_TOOL_DIR is built on line 46 from ${RUNNER_TOOL_CACHE} (inherited env) and VERSION, which comes from inputs.version. Nothing strips newlines first with printf '%s' ... | tr -d '\n\r', so a value containing a newline could add extra PATH entries. Fix: safe=$(printf '%s' "$KUBECTL_TOOL_DIR" | tr -d '\n\r'); echo "$safe" >> "$GITHUB_PATH".
 
 Locations:
 
@@ -46,17 +43,9 @@ Locations:
 
 ### Iteration 1
 
-**Fixes applied:** script-injection, github-env-injection, static-inline-injection
+**Fixes applied:** script-injection, static-inline-injection, github-env-injection
 
 **Notes:**
 
-Moved inputs.version and github.token into the step's env: as INPUT_VERSION and GH_TOKEN. Quoted the $VERSION test, the openssl/cat file paths and the trap's rm path. Removed newlines from KUBECTL_TOOL_DIR with printf | tr -d '\n\r' before it is written to GITHUB_PATH.
-
-### Iteration 2
-
-**Fixes applied:** github-env-injection
-
-**Notes:**
-
-Fixed corrupted lines in action.yml: restored 'echo "Adding kubectl to path"', placed SAFE_TOOL_DIR=$(printf '%s' "$KUBECTL_TOOL_DIR" | tr -d '\n\r') on its own line, and fixed the GITHUB_PATH write to 'echo "$SAFE_TOOL_DIR" >> "$GITHUB_PATH"' with balanced quotes.
+Moved inputs.version and github.token out of the run script and into the step's env as INPUT_VERSION and GITHUB_TOKEN. The script now reads them as quoted variables (VERSION="$INPUT_VERSION"). Before KUBECTL_TOOL_DIR is written to $GITHUB_PATH, newlines and carriage returns are now stripped from it with printf | tr -d '\n\r'. Nothing else in the script changed. I haven't run the action or the analysis again, so these fixes aren't tested.
 
