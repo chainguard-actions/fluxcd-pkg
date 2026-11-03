@@ -1,0 +1,25 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 0.6.4
+      - name: Assert kubeconform version normalized
+        run: |
+          ACTUAL="$(kubeconform -v)"
+          echo "actual: $ACTUAL"
+          if [ "$ACTUAL" != "v0.6.4" ]; then
+            echo "FAIL: expected 'v0.6.4'"
+            exit 1
+          fi
+          case "$(command -v kubeconform)" in
+            *"/kubeconform/v0.6.4/"*) ;;
+            *) echo "FAIL: expected tool dir with v-prefixed version, got $(command -v kubeconform)"; exit 1 ;;
+          esac
+          echo "PASS"

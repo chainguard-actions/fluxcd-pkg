@@ -1,0 +1,26 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 4.43.1
+      - name: Assert yq installed and v prefix normalized
+        run: |
+          OUT="$(yq --version)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "4.43.1"; then
+            echo "FAIL: expected version 4.43.1"
+            exit 1
+          fi
+          if [ ! -d "${RUNNER_TOOL_CACHE}/yq/v4.43.1" ]; then
+            echo "FAIL: expected tool dir ${RUNNER_TOOL_CACHE}/yq/v4.43.1"
+            ls -la "${RUNNER_TOOL_CACHE}/yq" || true
+            exit 1
+          fi
+          echo "PASS"

@@ -1,0 +1,37 @@
+name: Test cached install skips download
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Pre-populate tool cache with fake yq for nonexistent version
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          if [ "$ARCH" = "x64" ]; then ARCH=amd64; fi
+          DIR="${RUNNER_TOOL_CACHE}/yq/v99.99.99/${OS}/${ARCH}"
+          mkdir -p "$DIR"
+          printf '#!/bin/sh\necho "yq (fake cached) version v99.99.99"\n' > "$DIR/yq"
+          chmod +x "$DIR/yq"
+          cp "$DIR/yq" "$DIR/yq_${OS}_${ARCH}"
+          echo "CACHED_DIR=$DIR" >> "$GITHUB_ENV"
+      - id: action
+        uses: .
+        with:
+          version: 99.99.99
+      - name: Assert cached yq used
+        run: |
+          echo "which: $(which yq)"
+          OUT="$(yq --version)"
+          echo "actual: $OUT"
+          if [ "$OUT" != "yq (fake cached) version v99.99.99" ]; then
+            echo "FAIL: expected cached fake yq to be on PATH"
+            exit 1
+          fi
+          if [ "$(which yq)" != "$CACHED_DIR/yq" ]; then
+            echo "FAIL: yq not resolved from cache dir"
+            exit 1
+          fi
+          echo "PASS"

@@ -1,0 +1,33 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Put the expected tool dir on PATH (installer checks `command -v helm` after install)
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          echo "${RUNNER_TOOL_CACHE}/helm/v3.13.3/${OS}/${ARCH}" >> "$GITHUB_PATH"
+      - id: action
+        uses: .
+        with:
+          version: 3.13.3
+      - name: Assert version normalized with v prefix
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          EXPECTED_DIR="${RUNNER_TOOL_CACHE}/helm/v3.13.3/${OS}/${ARCH}"
+          echo "expected dir: $EXPECTED_DIR"
+          if [ ! -x "$EXPECTED_DIR/helm" ]; then
+            echo "FAIL: helm not installed into v-prefixed tool dir"
+            exit 1
+          fi
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          case "$ACTUAL" in
+            v3.13.3*) echo "PASS" ;;
+            *) echo "FAIL: expected v3.13.3"; exit 1 ;;
+          esac

@@ -1,0 +1,285 @@
+/*
+Copyright 2022 Stefan Prodan
+Copyright 2022 The Flux authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package ssa
+
+import (
+	"bytes"
+	"fmt"
+	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
+)
+
+const managedFieldsPath = "/metadata/managedFields"
+
+// JSONPatch defines a patch as specified by RFC 6902
+// https://www.rfc-editor.org/rfc/rfc6902
+type JSONPatch struct {
+	Operation string                      `json:"op"`
+	Path      string                      `json:"path"`
+	Value     []metav1.ManagedFieldsEntry `json:"value,omitempty"`
+}
+
+// NewPatchRemove returns a JSONPatch for removing the specified path.
+func NewPatchRemove(path string) JSONPatch {
+	return JSONPatch{
+		Operation: "remove",
+		Path:      path,
+	}
+}
+
+// NewPatchReplace returns a JSONPatch for replacing the specified path with the given value.
+func NewPatchReplace(path string, value []metav1.ManagedFieldsEntry) JSONPatch {
+	return JSONPatch{
+		Operation: "replace",
+		Path:      path,
+		Value:     value,
+	}
+}
+
+// FieldManager identifies a workflow that's managing fields.
+type FieldManager struct {
+	// Name is the name of the workflow managing fields.
+	Name string `json:"name"`
+
+	// ExactMatch controls the matching behavior for the manager name.
+	// When true, requires an exact match. When false, it uses prefix matching.
+	ExactMatch bool `json:"exactMatch"`
+
+	// OperationType is the type of operation performed by this manager, can be 'update' or 'apply'.
+	OperationType metav1.ManagedFieldsOperationType `json:"operationType"`
+}
+
+// matchFieldManager checks if the given ManagedFieldsEntry matches the specified FieldManager.
+func matchFieldManager(entry metav1.ManagedFieldsEntry, manager FieldManager) bool {
+	if entry.Operation != manager.OperationType || entry.Subresource != "" {
+		return false
+	}
+
+	if manager.ExactMatch {
+		return entry.Manager == manager.Name
+	}
+	return strings.HasPrefix(entry.Manager, manager.Name)
+}
+
+// PatchRemoveFieldsManagers returns a JSONPatch array for removing managers with matching name or prefix.
+func PatchRemoveFieldsManagers(object *unstructured.Unstructured, managers []FieldManager) []JSONPatch {
+	objEntries := object.GetManagedFields()
+
+	var patches []JSONPatch
+	entries := make([]metav1.ManagedFieldsEntry, 0, len(objEntries))
+	for _, entry := range objEntries {
+		exclude := false
+		for _, manager := range managers {
+			if matchFieldManager(entry, manager) {
+				exclude = true
+				break
+			}
+		}
+		if !exclude {
+			entries = append(entries, entry)
+		}
+	}
+
+	if len(entries) == len(objEntries) {
+		return nil
+	}
+
+	if len(entries) == 0 {
+		entries = append(entries, metav1.ManagedFieldsEntry{})
+	}
+
+	return append(patches, NewPatchReplace(managedFieldsPath, entries))
+}
+
+// PatchReplaceFieldsManagers returns a JSONPatch array for replacing the managers with matching
+// name and operation type with the specified manager name and an apply operation.
+func PatchReplaceFieldsManagers(object *unstructured.Unstructured, managers []FieldManager, name string) ([]JSONPatch, error) {
+	objEntries := object.GetManagedFields()
+
+	var prevManagedFields metav1.ManagedFieldsEntry
+	empty := metav1.ManagedFieldsEntry{}
+
+	// save the previous manager fields
+	for _, entry := range objEntries {
+		if entry.Manager == name && entry.Operation == metav1.ManagedFieldsOperationApply {
+			prevManagedFields = entry
+		}
+	}
+
+	var patches []JSONPatch
+	entries := make([]metav1.ManagedFieldsEntry, 0, len(objEntries))
+	edited := false
+
+each_entry:
+	for _, entry := range objEntries {
+		// no need to append entry for previous managedField
+		// since it will be merged with other managedFields and
+		// appended at the end.
+		if entry == prevManagedFields {
+			continue
+		}
+
+		for _, manager := range managers {
+			if matchFieldManager(entry, manager) {
+
+				// if no previous managedField was found,
+				// rename the first match.
+				if prevManagedFields == empty {
+					entry.Manager = name
+					entry.Operation = metav1.ManagedFieldsOperationApply
+					prevManagedFields = entry
+					edited = true
+					continue each_entry
+				}
+
+				mergedField, err := mergeManagedFieldsV1(prevManagedFields.FieldsV1, entry.FieldsV1)
+				if err != nil {
+					return nil, fmt.Errorf("unable to merge managed fields: '%w'", err)
+				}
+				prevManagedFields.FieldsV1 = mergedField
+				edited = true
+				continue each_entry
+			}
+		}
+		entries = append(entries, entry)
+	}
+
+	if !edited {
+		return nil, nil
+	}
+
+	entries = append(entries, prevManagedFields)
+	return append(patches, NewPatchReplace(managedFieldsPath, entries)), nil
+}
+
+// PatchMigrateToVersion returns a JSONPatch array that rewrites every
+// managed fields entry on the object to the given apiVersion — across
+// all field managers and both the main resource and its subresources.
+// It returns nil if the object has no managed fields or if every entry
+// already matches the given apiVersion.
+//
+// This is intended to be used before applying an object at a newer API
+// version of a CRD whose newer version adds fields with default values.
+// When any managed fields entry is still tagged with an older apiVersion
+// (regardless of which field manager owns it, or whether the entry
+// belongs to a subresource) the API server can reject the apply with
+// "field not declared in schema" for the newly-defaulted fields.
+// Rewriting every entry first avoids that.
+func PatchMigrateToVersion(object *unstructured.Unstructured, apiVersion string) ([]JSONPatch, error) {
+	objEntries := object.GetManagedFields()
+
+	// Early return if no managed fields
+	if len(objEntries) == 0 {
+		return nil, nil
+	}
+
+	entries := make([]metav1.ManagedFieldsEntry, 0, len(objEntries))
+	changed := false
+
+	for _, entry := range objEntries {
+		if entry.APIVersion != apiVersion {
+			entry.APIVersion = apiVersion
+			changed = true
+		}
+		entries = append(entries, entry)
+	}
+
+	// No changes needed
+	if !changed {
+		return nil, nil
+	}
+
+	return []JSONPatch{NewPatchReplace(managedFieldsPath, entries)}, nil
+}
+
+func mergeManagedFieldsV1(prevField *metav1.FieldsV1, newField *metav1.FieldsV1) (*metav1.FieldsV1, error) {
+	if prevField == nil && newField == nil {
+		return nil, nil
+	}
+
+	if prevField == nil {
+		return newField, nil
+	}
+
+	if newField == nil {
+		return prevField, nil
+	}
+
+	prevSet, err := FieldsToSet(*prevField)
+	if err != nil {
+		return nil, err
+	}
+
+	newSet, err := FieldsToSet(*newField)
+	if err != nil {
+		return nil, err
+	}
+
+	unionSet := prevSet.Union(&newSet)
+	mergedField, err := SetToFields(*unionSet)
+	if err != nil {
+		return nil, fmt.Errorf("unable to convert managed set to field: %s", err)
+	}
+
+	return &mergedField, nil
+}
+
+// PatchRemoveAnnotations returns a JSONPatch array for removing annotations with matching keys.
+func PatchRemoveAnnotations(object *unstructured.Unstructured, keys []string) []JSONPatch {
+	var patches []JSONPatch
+	annotations := object.GetAnnotations()
+	for _, key := range keys {
+		if _, ok := annotations[key]; ok {
+			path := fmt.Sprintf("/metadata/annotations/%s", strings.ReplaceAll(key, "/", "~1"))
+			patches = append(patches, NewPatchRemove(path))
+		}
+	}
+	return patches
+}
+
+// PatchRemoveLabels returns a JSONPatch array for removing labels with matching keys.
+func PatchRemoveLabels(object *unstructured.Unstructured, keys []string) []JSONPatch {
+	var patches []JSONPatch
+	labels := object.GetLabels()
+	for _, key := range keys {
+		if _, ok := labels[key]; ok {
+			path := fmt.Sprintf("/metadata/labels/%s", strings.ReplaceAll(key, "/", "~1"))
+			patches = append(patches, NewPatchRemove(path))
+		}
+	}
+	return patches
+}
+
+// FieldsToSet and SetsToFields are copied from
+// https://github.com/kubernetes/apiserver/blob/c4c20f4f7d4ca609906621943c748bc16797a5f3/pkg/endpoints/handlers/fieldmanager/internal/fields.go
+// since it is an internal module and can't be imported
+
+// FieldsToSet creates a set paths from an input trie of fields
+func FieldsToSet(f metav1.FieldsV1) (s fieldpath.Set, err error) {
+	err = s.FromJSON(bytes.NewReader(f.Raw))
+	return s, err
+}
+
+// SetToFields creates a trie of fields from an input set of paths
+func SetToFields(s fieldpath.Set) (f metav1.FieldsV1, err error) {
+	f.Raw, err = s.ToJSON()
+	return f, err
+}

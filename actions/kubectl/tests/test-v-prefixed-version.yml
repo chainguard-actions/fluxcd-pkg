@@ -1,0 +1,25 @@
+name: Test v-prefixed version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v1.29.2
+      - name: Assert kubectl v1.29.2 is on PATH
+        run: |
+          OUT="$(kubectl version --client -o json)"
+          echo "$OUT"
+          if ! echo "$OUT" | grep -q '"gitVersion": *"v1.29.2"'; then
+            echo "FAIL: expected gitVersion v1.29.2"
+            exit 1
+          fi
+          if [ -d "$RUNNER_TOOL_CACHE/kubectl/vv1.29.2" ]; then
+            echo "FAIL: double v prefix in tool dir"
+            exit 1
+          fi
+          echo "PASS"

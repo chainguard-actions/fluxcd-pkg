@@ -1,0 +1,45 @@
+name: Test cached reinstall
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Put the expected tool dir on PATH (installer checks `command -v helm` after install)
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          echo "${RUNNER_TOOL_CACHE}/helm/v3.14.0/${OS}/${ARCH}" >> "$GITHUB_PATH"
+      - id: first
+        uses: .
+        with:
+          version: v3.14.0
+      - name: Record binary mtime
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          BIN="${RUNNER_TOOL_CACHE}/helm/v3.14.0/${OS}/${ARCH}/helm"
+          if [ ! -x "$BIN" ]; then echo "FAIL: missing $BIN"; exit 1; fi
+          stat -c %Y "$BIN" > /tmp/helm-mtime
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          sleep 2
+      - id: second
+        uses: .
+        with:
+          version: v3.14.0
+      - name: Assert cached binary reused
+        run: |
+          BEFORE="$(cat /tmp/helm-mtime)"
+          AFTER="$(stat -c %Y "$BIN")"
+          echo "before: $BEFORE after: $AFTER"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "FAIL: binary was reinstalled instead of reused"
+            exit 1
+          fi
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          case "$ACTUAL" in
+            v3.14.0*) echo "PASS" ;;
+            *) echo "FAIL: expected v3.14.0"; exit 1 ;;
+          esac

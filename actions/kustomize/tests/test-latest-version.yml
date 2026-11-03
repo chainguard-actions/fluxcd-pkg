@@ -1,0 +1,59 @@
+name: Test latest version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Resolve latest kustomize release tag (same API the action uses)
+        id: latest
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(curl -fsSL -H "Authorization: token ${TOKEN}" https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest | grep tag_name | cut -d '"' -f 4)
+          echo "latest tag_name: $TAG"
+          if [ -z "$TAG" ]; then
+            echo "FAIL: could not resolve latest release tag"
+            exit 1
+          fi
+          # The action only prefixes 'v' if missing; tags like "kustomize/v5.8.3"
+          # become "vkustomize/v5.8.3", which yields a 404 download URL.
+          case "$TAG" in
+            v[0-9]*) echo "expect=success" >> "$GITHUB_OUTPUT" ;;
+            [0-9]*)  echo "expect=success" >> "$GITHUB_OUTPUT" ;;
+            *)       echo "expect=failure" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: latest
+      - name: Assert outcome matches the latest tag format
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          EXPECT: ${{ steps.latest.outputs.expect }}
+          TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          echo "tag: $TAG expect: $EXPECT outcome: $OUTCOME"
+          if [ "$OUTCOME" != "$EXPECT" ]; then
+            echo "FAIL: expected outcome '$EXPECT' but got '$OUTCOME'"
+            exit 1
+          fi
+          if [ "$OUTCOME" = "success" ]; then
+            which kustomize || { echo "FAIL: kustomize not on PATH"; exit 1; }
+            OUT="$(kustomize version)"
+            echo "version: $OUT"
+            WANT="${TAG#v}"
+            if ! echo "$OUT" | grep -q "$WANT"; then
+              echo "FAIL: installed version does not match $TAG"
+              exit 1
+            fi
+          else
+            if [ -x "$RUNNER_TOOL_CACHE/kustomize/v${TAG}/linux/amd64/kustomize" ]; then
+              echo "FAIL: action failed but a binary was installed"
+              exit 1
+            fi
+          fi
+          echo "PASS"

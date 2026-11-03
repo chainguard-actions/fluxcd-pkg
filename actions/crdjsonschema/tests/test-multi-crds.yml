@@ -1,0 +1,44 @@
+name: Test multiple CRDs and versions
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Clean output dir
+        run: rm -rf "$GITHUB_WORKSPACE/out/multi"
+      - id: action
+        uses: .
+        with:
+          crd: tests/fixtures/multi-crds.yaml
+          output: out/multi
+      - name: Assert files and content
+        run: |
+          OUT="$GITHUB_WORKSPACE/out/multi"
+          ls -la "$OUT" || { echo "FAIL: output dir missing"; exit 1; }
+          for f in gadget-demo-v1beta1.json gadget-demo-v1.json sprocket-tools-v2.json _definitions.json all.json; do
+            if [ ! -s "$OUT/$f" ]; then
+              echo "FAIL: missing $f"
+              exit 1
+            fi
+          done
+          if ls "$OUT" | grep -qi configmap; then
+            echo "FAIL: non-CRD document produced a schema"
+            exit 1
+          fi
+          python3 - "$OUT" <<'EOF'
+          import json, sys, os
+          out = sys.argv[1]
+          d = json.load(open(os.path.join(out, "_definitions.json")))["definitions"]
+          print(sorted(d.keys()))
+          expected = {"demo.example.org.v1beta1.Gadget", "demo.example.org.v1.Gadget", "tools.example.net.v2.Sprocket"}
+          assert set(d.keys()) == expected, d.keys()
+          assert d["tools.example.net.v2.Sprocket"]["properties"]["apiVersion"]["enum"] == ["tools.example.net/v2"]
+          a = json.load(open(os.path.join(out, "all.json")))
+          refs = sorted(r["$ref"] for r in a["oneOf"])
+          assert refs == sorted("_definitions.json#/definitions/" + k for k in expected), refs
+          g = json.load(open(os.path.join(out, "gadget-demo-v1.json")))
+          assert g["properties"]["spec"]["properties"]["replicas"]["type"] == "integer"
+          print("PASS")
+          EOF

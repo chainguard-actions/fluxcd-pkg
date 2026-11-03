@@ -1,0 +1,35 @@
+name: Test specific Kubernetes version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          k8s_version: "1.31.x"
+      - name: Assert envtest assets for 1.31 installed
+        run: |
+          echo "KUBEBUILDER_ASSETS raw: $KUBEBUILDER_ASSETS"
+          ASSETS="${KUBEBUILDER_ASSETS//\'/}"
+          if [ -z "$ASSETS" ] || [ ! -d "$ASSETS" ]; then
+            echo "FAIL: KUBEBUILDER_ASSETS missing or not a directory"
+            exit 1
+          fi
+          case "$ASSETS" in
+            *1.31.*) ;;
+            *) echo "FAIL: expected path to contain 1.31."; exit 1 ;;
+          esac
+          if [ ! -x "$ASSETS/kube-apiserver" ]; then
+            echo "FAIL: kube-apiserver missing"
+            exit 1
+          fi
+          VER="$("$ASSETS/kube-apiserver" --version)"
+          echo "kube-apiserver version: $VER"
+          if ! echo "$VER" | grep -q 'v1\.31\.'; then
+            echo "FAIL: expected kube-apiserver v1.31.x"
+            exit 1
+          fi
+          echo "PASS"

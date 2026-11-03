@@ -1,0 +1,35 @@
+name: Test latest version (default)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Put a helm shim on PATH (installer checks `command -v helm` after install)
+        run: |
+          mkdir -p /tmp/helm-shim
+          cat > /tmp/helm-shim/helm <<'EOF'
+          #!/bin/sh
+          BIN="$(ls -1d "${RUNNER_TOOL_CACHE}"/helm/v*/*/*/helm 2>/dev/null | sort -V | tail -n1)"
+          [ -n "$BIN" ] || { echo "helm shim: no helm in tool cache" >&2; exit 127; }
+          exec "$BIN" "$@"
+          EOF
+          chmod +x /tmp/helm-shim/helm
+          echo "/tmp/helm-shim" >> "$GITHUB_PATH"
+      - id: action
+        uses: .
+      - name: Assert helm installed
+        run: |
+          WHICH="$(command -v helm || true)"
+          echo "helm path: $WHICH"
+          case "$WHICH" in
+            "${RUNNER_TOOL_CACHE}"/helm/v*) ;;
+            *) echo "FAIL: helm not from tool cache"; exit 1 ;;
+          esac
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          case "$ACTUAL" in
+            v[0-9]*) echo "PASS" ;;
+            *) echo "FAIL: unexpected version output"; exit 1 ;;
+          esac

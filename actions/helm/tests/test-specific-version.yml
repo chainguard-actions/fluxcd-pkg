@@ -1,0 +1,34 @@
+name: Test specific version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v3.14.0
+      - name: Assert helm installed at requested version
+        run: |
+          set -e
+          WHICH="$(command -v helm || true)"
+          echo "helm path: $WHICH"
+          if [ -z "$WHICH" ]; then
+            echo "FAIL: helm not on PATH"
+            exit 1
+          fi
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          EXPECTED_DIR="${RUNNER_TOOL_CACHE}/helm/v3.14.0/${OS}/${ARCH}"
+          if [ ! -x "$EXPECTED_DIR/helm" ]; then
+            echo "FAIL: helm binary not found at $EXPECTED_DIR/helm"
+            exit 1
+          fi
+          ACTUAL="$(helm version --short)"
+          echo "actual: $ACTUAL"
+          case "$ACTUAL" in
+            v3.14.0*) echo "PASS" ;;
+            *) echo "FAIL: expected v3.14.0"; exit 1 ;;
+          esac

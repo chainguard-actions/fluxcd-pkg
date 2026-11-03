@@ -1,0 +1,47 @@
+name: Test basic usage (defaults)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+      - name: Assert setup-envtest installed and on PATH
+        run: |
+          echo "VERSION env: $VERSION"
+          if [ "$VERSION" != "latest" ]; then
+            echo "FAIL: expected VERSION=latest"
+            exit 1
+          fi
+          if ! command -v setup-envtest >/dev/null 2>&1; then
+            echo "FAIL: setup-envtest not on PATH"
+            exit 1
+          fi
+          echo "setup-envtest at: $(command -v setup-envtest)"
+          echo "PASS"
+      - name: Assert KUBEBUILDER_ASSETS points at envtest binaries
+        run: |
+          echo "KUBEBUILDER_ASSETS raw: $KUBEBUILDER_ASSETS"
+          ASSETS="${KUBEBUILDER_ASSETS//\'/}"
+          if [ -z "$ASSETS" ]; then
+            echo "FAIL: KUBEBUILDER_ASSETS is empty"
+            exit 1
+          fi
+          if [ ! -d "$ASSETS" ]; then
+            echo "FAIL: $ASSETS is not a directory"
+            exit 1
+          fi
+          ls -la "$ASSETS"
+          for b in kube-apiserver etcd kubectl; do
+            if [ ! -x "$ASSETS/$b" ]; then
+              echo "FAIL: missing $b in $ASSETS"
+              exit 1
+            fi
+          done
+          case "$ASSETS" in
+            "$RUNNER_TOOL_CACHE/envtest"*) ;;
+            *) echo "FAIL: assets not under $RUNNER_TOOL_CACHE/envtest"; exit 1 ;;
+          esac
+          echo "PASS"

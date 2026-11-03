@@ -1,0 +1,26 @@
+name: Test specific version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 1.30.0
+      - name: Assert kubectl v1.30.0 is on PATH
+        run: |
+          which kubectl
+          OUT="$(kubectl version --client -o json)"
+          echo "$OUT"
+          if ! echo "$OUT" | grep -q '"gitVersion": *"v1.30.0"'; then
+            echo "FAIL: expected gitVersion v1.30.0"
+            exit 1
+          fi
+          case "$(which kubectl)" in
+            "$RUNNER_TOOL_CACHE"/kubectl/v1.30.0/linux/*) ;;
+            *) echo "FAIL: kubectl not installed in tool cache dir"; exit 1 ;;
+          esac
+          echo "PASS"

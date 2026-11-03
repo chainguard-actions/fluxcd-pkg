@@ -1,0 +1,770 @@
+/*
+Copyright 2025 The Flux authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package aws_test
+
+import (
+	"context"
+	"net/url"
+	"testing"
+	"time"
+
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/sts/types"
+	"github.com/google/go-containerregistry/pkg/authn"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	cryptov1 "github.com/fluxcd/pkg/apis/crypto/v1"
+	"github.com/fluxcd/pkg/auth"
+	"github.com/fluxcd/pkg/auth/aws"
+)
+
+func TestProvider_NewControllerToken(t *testing.T) {
+	impl := &mockImplementation{
+		t:              t,
+		argRegion:      "us-east-1",
+		argProxyURL:    &url.URL{Scheme: "http", Host: "proxy.example.com"},
+		argSTSEndpoint: "https://sts.amazonaws.com",
+		returnCreds:    awssdk.Credentials{AccessKeyID: "access-key-id"},
+	}
+
+	for _, tt := range []struct {
+		name               string
+		stsEndpoint        string
+		artifactRepository string
+		skipSTSRegion      bool
+		err                string
+	}{
+		{
+			name:        "valid",
+			stsEndpoint: "https://sts.amazonaws.com",
+		},
+		{
+			name:          "missing region",
+			stsEndpoint:   "https://sts.amazonaws.com",
+			skipSTSRegion: true,
+			err: "AWS_REGION environment variable is not set in the Flux controller. " +
+				"if you have properly configured IAM Roles for Service Accounts (IRSA) or EKS Pod Identity, " +
+				"please delete/replace the controller pod so the EKS admission controllers can inject this " +
+				"environment variable, or set it manually if the cluster is not EKS",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			if !tt.skipSTSRegion {
+				t.Setenv("AWS_REGION", "us-east-1")
+			}
+
+			opts := []auth.Option{
+				auth.WithProxyURL(url.URL{Scheme: "http", Host: "proxy.example.com"}),
+				auth.WithAWSSTSEndpoint(tt.stsEndpoint),
+			}
+
+			provider := aws.Provider{Implementation: impl}
+			token, err := provider.NewControllerToken(t.Context(), opts...)
+
+			if tt.err == "" {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(token).To(Equal(&aws.Credentials{Credentials: types.Credentials{
+					AccessKeyId:     awssdk.String("access-key-id"),
+					SecretAccessKey: awssdk.String(""),
+					SessionToken:    awssdk.String(""),
+					Expiration:      awssdk.Time(time.Time{}),
+				}}))
+			} else {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(Equal(tt.err))
+				g.Expect(token).To(BeNil())
+			}
+		})
+	}
+}
+
+func TestProvider_NewAccessCredentialForIdentity(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		roleARN            string
+		stsEndpoint        string
+		artifactRepository string
+		skipSTSRegion      bool
+		err                string
+	}{
+		{
+			name:        "valid",
+			roleARN:     "arn:aws:iam::1234567890:role/some-role",
+			stsEndpoint: "https://sts.amazonaws.com",
+		},
+		{
+			name:        "us gov is valid",
+			roleARN:     "arn:aws-us-gov:iam::1234567890:role/some-role",
+			stsEndpoint: "https://sts.amazonaws.com",
+		},
+		{
+			name:          "missing region",
+			roleARN:       "arn:aws:iam::1234567890:role/some-role",
+			stsEndpoint:   "https://sts.amazonaws.com",
+			skipSTSRegion: true,
+			err: "an AWS region is required for authenticating with a service account. " +
+				"please configure one in the object spec",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			impl := &mockImplementation{
+				t:                  t,
+				argRegion:          "us-east-1",
+				argRoleARN:         tt.roleARN,
+				argRoleSessionName: "test-sa.test-ns.us-east-1.fluxcd.io",
+				argOIDCToken:       "oidc-token",
+				argProxyURL:        &url.URL{Scheme: "http", Host: "proxy.example.com"},
+				argSTSEndpoint:     "https://sts.amazonaws.com",
+				returnCreds:        awssdk.Credentials{AccessKeyID: "access-key-id"},
+			}
+
+			oidcToken := "oidc-token"
+			serviceAccount := &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-sa",
+					Namespace: "test-ns",
+				},
+			}
+
+			opts := []auth.Option{
+				auth.WithProxyURL(url.URL{Scheme: "http", Host: "proxy.example.com"}),
+				auth.WithAWSSTSEndpoint(tt.stsEndpoint),
+				auth.WithAWSRoleARN(tt.roleARN),
+				auth.WithServiceAccountName(serviceAccount.Name),
+				auth.WithObject("", "ServiceAccount", serviceAccount),
+			}
+
+			if !tt.skipSTSRegion {
+				opts = append(opts, auth.WithAWSRegion("us-east-1"))
+			}
+
+			provider := aws.Provider{Implementation: impl}
+			token, err := provider.NewAccessCredentialForIdentity(context.Background(), &auth.JWTCredential{
+				Provider: cryptov1.CredentialProviderKubernetes,
+				Token:    oidcToken,
+			}, opts...)
+
+			if tt.err == "" {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(token).To(Equal(&aws.Credentials{Credentials: types.Credentials{
+					AccessKeyId:     awssdk.String("access-key-id"),
+					SecretAccessKey: awssdk.String(""),
+					SessionToken:    awssdk.String(""),
+					Expiration:      awssdk.Time(time.Time{}),
+				}}))
+			} else {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(Equal(tt.err))
+				g.Expect(token).To(BeNil())
+			}
+		})
+	}
+}
+
+func TestProvider_GetAudiences(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		g := NewWithT(t)
+		aud, err := aws.Provider{}.GetAudiences(context.Background())
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(aud).To(Equal([]string{"sts.amazonaws.com"}))
+	})
+
+	t.Run("custom", func(t *testing.T) {
+		g := NewWithT(t)
+		aud, err := aws.Provider{}.GetAudiences(context.Background(),
+			auth.WithCredentialAudiences("my-audience"))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(aud).To(Equal([]string{"my-audience"}))
+	})
+}
+
+func TestProvider_GetIdentity(t *testing.T) {
+	g := NewWithT(t)
+
+	identity, err := aws.Provider{}.GetIdentity(
+		auth.WithAWSRoleARN("arn:aws:iam::1234567890:role/some-role"))
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(identity).To(Equal("arn:aws:iam::1234567890:role/some-role"))
+}
+
+func TestProvider_NewArtifactRegistryCredentials(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		artifactRepository string
+		expectedPublicECR  bool
+		expectedRegion     string
+	}{
+		{
+			name:               "non public ECR, us-east-1",
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.com/foo",
+			expectedRegion:     "us-east-1",
+			expectedPublicECR:  false,
+		},
+		{
+			name:               "non public ECR, us-west-2",
+			artifactRepository: "012345678901.dkr.ecr.us-west-2.amazonaws.com/foo",
+			expectedRegion:     "us-west-2",
+			expectedPublicECR:  false,
+		},
+		{
+			name:               "public ECR",
+			artifactRepository: "public.ecr.aws",
+			expectedRegion:     "us-east-1", // Public ECR is always us-east-1
+			expectedPublicECR:  true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			impl := &mockImplementation{
+				t:                t,
+				publicECR:        tt.expectedPublicECR,
+				argRegion:        tt.expectedRegion,
+				argProxyURL:      &url.URL{Scheme: "http", Host: "proxy.example.com"},
+				argCredsProvider: credentials.NewStaticCredentialsProvider("access-key-id", "secret-access-key", "session-token"),
+				returnCreds: awssdk.Credentials{
+					AccessKeyID:     "access-key-id",
+					SecretAccessKey: "secret-access-key",
+					SessionToken:    "session-token",
+				},
+				returnUsername: "username",
+				returnPassword: "password",
+			}
+
+			opts := []auth.Option{
+				auth.WithProxyURL(url.URL{Scheme: "http", Host: "proxy.example.com"}),
+			}
+
+			provider := aws.Provider{Implementation: impl}
+			creds, err := auth.GetArtifactRegistryCredentials(
+				context.Background(), provider, tt.artifactRepository, opts...)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(creds).To(Equal(&auth.ArtifactRegistryCredentials{
+				Authenticator: authn.FromConfig(authn.AuthConfig{
+					Username: "username",
+					Password: "password",
+				}),
+			}))
+		})
+	}
+}
+
+func TestProvider_GetAccessCredentialOptionsForArtifactRepository(t *testing.T) {
+	g := NewWithT(t)
+
+	opts, err := aws.Provider{}.GetAccessCredentialOptionsForArtifactRepository(
+		"012345678901.dkr.ecr.us-east-1.amazonaws.com/foo:v1")
+	g.Expect(err).NotTo(HaveOccurred())
+
+	var o auth.Options
+	o.Apply(opts...)
+
+	g.Expect(o.AWSRegion).To(Equal("us-east-1"))
+}
+
+func TestProvider_ParseArtifactRepository(t *testing.T) {
+	tests := []struct {
+		artifactRepository string
+		expectedRegion     string
+		expectValid        bool
+	}{
+		{
+			artifactRepository: "012345678901.dkr.ecr.eusc-de-east-1.amazonaws.eu/foo:v1",
+			expectedRegion:     "eusc-de-east-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.eusc-de-east-1.amazonaws.eu/foo",
+			expectedRegion:     "eusc-de-east-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.eusc-de-east-1.amazonaws.eu",
+			expectedRegion:     "eusc-de-east-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.eusc-de-east-1.amazonaws.eu/v2/part/part",
+			expectedRegion:     "eusc-de-east-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.com/foo:v1",
+			expectedRegion:     "us-east-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.com/foo",
+			expectedRegion:     "us-east-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.com",
+			expectedRegion:     "us-east-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.com/v2/part/part",
+			expectedRegion:     "us-east-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.cn-north-1.amazonaws.com.cn/foo",
+			expectedRegion:     "cn-north-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr-fips.us-gov-west-1.amazonaws.com",
+			expectedRegion:     "us-gov-west-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-secret-region.sc2s.sgov.gov",
+			expectedRegion:     "us-secret-region",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr-fips.us-ts-region.c2s.ic.gov",
+			expectedRegion:     "us-ts-region",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.uk-region.cloud.adc-e.uk",
+			expectedRegion:     "uk-region",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-ts-region.csp.hci.ic.gov",
+			expectedRegion:     "us-ts-region",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "557238627320.dkr-ecr.us-west-2.on.aws/foo:v1",
+			expectedRegion:     "us-west-2",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "557238627320.dkr-ecr.us-west-2.on.aws/foo",
+			expectedRegion:     "us-west-2",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "557238627320.dkr-ecr.us-west-2.on.aws",
+			expectedRegion:     "us-west-2",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "557238627320.dkr-ecr.eu-central-1.on.aws/v2/part/part",
+			expectedRegion:     "eu-central-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr-ecr.cn-north-1.on.amazonwebservices.com.cn/foo",
+			expectedRegion:     "cn-north-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "012345678901.dkr-ecr.cn-north-1.on.amazonwebservices.com.cn",
+			expectedRegion:     "cn-north-1",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "gcr.io/foo/bar:baz",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "public.ecr.aws/foo/bar",
+			expectedRegion:     "public.ecr.aws",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "ecr-public.aws.com/foo/bar",
+			expectedRegion:     "public.ecr.aws",
+			expectValid:        true,
+		},
+		{
+			artifactRepository: "ecr-public.aws.com",
+			expectedRegion:     "public.ecr.aws",
+			expectValid:        true,
+		},
+		// Hosts that merely embed an ECR hostname are not ECR hosts.
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.com.example.org/foo",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.com.example.org",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "prefix-012345678901.dkr.ecr.us-east-1.amazonaws.com/foo",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "xdkr.ecr.us-east-1.amazonaws.com.example.org/foo",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.comcn/foo",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "012345678901.dkr.ecr.us-east-1.amazonaws.com.nc/foo",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "012345678901Xdkr.ecr.us-east-1.amazonaws.com/foo",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "public.ecr.aws.example.org/foo/bar",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "ecr-public.aws.com.example.org/foo/bar",
+			expectValid:        false,
+		},
+		// The registry ID is an AWS account ID, which is always 12 digits.
+		{
+			artifactRepository: "01234567890.dkr.ecr.us-east-1.amazonaws.com/foo",
+			expectValid:        false,
+		},
+		{
+			artifactRepository: "0123456789012.dkr.ecr.us-east-1.amazonaws.com/foo",
+			expectValid:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.artifactRepository, func(t *testing.T) {
+			g := NewWithT(t)
+
+			region, err := aws.Provider{}.ParseArtifactRepository(tt.artifactRepository)
+			g.Expect(err == nil).To(Equal(tt.expectValid))
+			g.Expect(region).To(Equal(tt.expectedRegion))
+		})
+	}
+}
+
+func TestProvider_NewRESTConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		clusterAddress string
+		caData         string
+		stsEndpoint    string
+	}{
+		{
+			name: "valid EKS cluster",
+		},
+		{
+			name: "us gov EKS cluster is valid",
+		},
+		{
+			name:           "valid EKS cluster with address match",
+			clusterAddress: "https://EXAMPLE1234567890123456789012345678.gr7.us-east-1.eks.amazonaws.com:443",
+		},
+		{
+			name:   "valid EKS cluster with CA",
+			caData: "-----BEGIN CERTIFICATE-----",
+		},
+		{
+			name:           "valid EKS cluster with address override",
+			clusterAddress: "https://different-endpoint.eks.amazonaws.com:443",
+		},
+		{
+			name:        "valid EKS cluster with custom STS endpoint",
+			stsEndpoint: "https://sts.amazonaws.com",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			impl := &mockImplementation{
+				t:                  t,
+				expectEKSAPICall:   tt.clusterAddress == "" || tt.caData == "",
+				argRegion:          "us-east-1",
+				argClusterName:     "test-cluster",
+				argProxyURL:        &url.URL{Scheme: "http", Host: "proxy.example.com"},
+				argSTSEndpoint:     tt.stsEndpoint,
+				argCredsProvider:   credentials.NewStaticCredentialsProvider("access-key-id", "secret-access-key", "session-token"),
+				returnCreds:        awssdk.Credentials{AccessKeyID: "access-key-id", SecretAccessKey: "secret-access-key", SessionToken: "session-token"},
+				returnEndpoint:     "https://EXAMPLE1234567890123456789012345678.gr7.us-east-1.eks.amazonaws.com",
+				returnCAData:       "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t", // base64 encoded "-----BEGIN CERTIFICATE-----"
+				returnPresignedURL: "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15&X-Amz-Algorithm=AWS4-HMAC-SHA256",
+			}
+
+			opts := []auth.Option{
+				auth.WithProxyURL(url.URL{Scheme: "http", Host: "proxy.example.com"}),
+				auth.WithAWSRegion("us-east-1"),
+				auth.WithAWSClusterName("test-cluster"),
+			}
+
+			if tt.clusterAddress != "" {
+				opts = append(opts, auth.WithClusterAddress(tt.clusterAddress))
+			}
+
+			if tt.caData != "" {
+				opts = append(opts, auth.WithCAData(tt.caData))
+			}
+
+			if tt.stsEndpoint != "" {
+				opts = append(opts, auth.WithAWSSTSEndpoint(tt.stsEndpoint))
+			}
+
+			provider := aws.Provider{Implementation: impl}
+			restConfig, err := auth.GetRESTConfig(context.Background(), provider, opts...)
+
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(restConfig).NotTo(BeNil())
+			expectedHost := "https://EXAMPLE1234567890123456789012345678.gr7.us-east-1.eks.amazonaws.com"
+			if tt.clusterAddress != "" {
+				expectedHost = tt.clusterAddress
+			}
+			g.Expect(restConfig.Host).To(Equal(expectedHost))
+			g.Expect(restConfig.BearerToken).To(Equal("k8s-aws-v1.aHR0cHM6Ly9zdHMudXMtZWFzdC0xLmFtYXpvbmF3cy5jb20vP0FjdGlvbj1HZXRDYWxsZXJJZGVudGl0eSZWZXJzaW9uPTIwMTEtMDYtMTUmWC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTY"))
+			g.Expect(restConfig.CAData).To(Equal([]byte("-----BEGIN CERTIFICATE-----")))
+			g.Expect(restConfig.ExpiresAt).To(BeTemporally(">", time.Now().Add(14*time.Minute)))
+			g.Expect(restConfig.ExpiresAt).To(BeTemporally("<", time.Now().Add(16*time.Minute)))
+		})
+	}
+}
+
+func TestProvider_GetAccessCredentialOptionsForCluster(t *testing.T) {
+	t.Run("with region", func(t *testing.T) {
+		g := NewWithT(t)
+
+		opts, err := aws.Provider{}.GetAccessCredentialOptionsForCluster(
+			auth.WithAWSRegion("us-west-2"),
+			auth.WithAWSClusterName("my-cluster"))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(opts).To(HaveLen(1))
+
+		var o auth.Options
+		o.Apply(opts[0]...)
+
+		g.Expect(o.AWSRegion).To(Equal("us-west-2"))
+	})
+
+	t.Run("without region", func(t *testing.T) {
+		g := NewWithT(t)
+
+		opts, err := aws.Provider{}.GetAccessCredentialOptionsForCluster(
+			auth.WithAWSClusterName("my-cluster"))
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(Equal("AWS region is required"))
+		g.Expect(opts).To(BeNil())
+	})
+}
+
+func TestProvider_GetAccessCredentialOptionsForGitRepository(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		gitURL         string
+		expectedRegion string
+		err            string
+	}{
+		{
+			name:           "valid CodeCommit URL",
+			gitURL:         "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo",
+			expectedRegion: "us-east-1",
+		},
+		{
+			name:           "valid CodeCommit FIPS URL",
+			gitURL:         "https://git-codecommit-fips.us-west-2.amazonaws.com/v1/repos/test-repo",
+			expectedRegion: "us-west-2",
+		},
+		{
+			name:           "valid CodeCommit China URL",
+			gitURL:         "https://git-codecommit.cn-north-1.amazonaws.com.cn/v1/repos/test-repo",
+			expectedRegion: "cn-north-1",
+		},
+		{
+			name: "nil URL",
+			err:  "Git URL must be specified for AWS CodeCommit authentication",
+		},
+		{
+			name:   "non-HTTPS URL",
+			gitURL: "http://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo",
+			err:    "AWS CodeCommit authentication requires an HTTPS Git URL",
+		},
+		{
+			name:   "invalid CodeCommit URL",
+			gitURL: "https://github.com/org/repo",
+			err:    "invalid AWS CodeCommit Git URL: github.com",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			var parsedURL *url.URL
+			if tt.gitURL != "" {
+				var err error
+				parsedURL, err = url.Parse(tt.gitURL)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+			acOpts, err := aws.Provider{}.GetAccessCredentialOptionsForGitRepository(parsedURL)
+			if tt.err != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(Equal(tt.err))
+				g.Expect(acOpts).To(BeNil())
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				var o auth.Options
+				o.Apply(acOpts...)
+				g.Expect(o.AWSRegion).To(Equal(tt.expectedRegion))
+			}
+		})
+	}
+}
+
+func TestProvider_ParseGitRepository(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		gitURL         string
+		expectedRegion string
+		err            string
+	}{
+		{
+			name:           "valid CodeCommit URL",
+			gitURL:         "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo",
+			expectedRegion: "us-east-1",
+		},
+		{
+			name:           "valid CodeCommit FIPS URL",
+			gitURL:         "https://git-codecommit-fips.us-west-2.amazonaws.com/v1/repos/test-repo",
+			expectedRegion: "us-west-2",
+		},
+		{
+			name:           "valid CodeCommit China URL",
+			gitURL:         "https://git-codecommit.cn-north-1.amazonaws.com.cn/v1/repos/test-repo",
+			expectedRegion: "cn-north-1",
+		},
+		{
+			name: "nil URL",
+			err:  "Git URL must be specified for AWS CodeCommit authentication",
+		},
+		{
+			name:   "non-HTTPS URL",
+			gitURL: "http://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo",
+			err:    "AWS CodeCommit authentication requires an HTTPS Git URL",
+		},
+		{
+			name:   "invalid CodeCommit URL",
+			gitURL: "https://github.com/org/repo",
+			err:    "invalid AWS CodeCommit Git URL: github.com",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			var parsedURL *url.URL
+			if tt.gitURL != "" {
+				var err error
+				parsedURL, err = url.Parse(tt.gitURL)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+			gitInput, err := aws.Provider{}.ParseGitRepository(parsedURL)
+			if tt.err != "" {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(Equal(tt.err))
+				g.Expect(gitInput).To(BeEmpty())
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(gitInput).To(Equal(tt.gitURL))
+			}
+		})
+	}
+}
+
+func TestProvider_NewGitCredentials(t *testing.T) {
+	invalidCredential := &auth.RESTConfig{Host: "invalid"}
+	proxyUrl := url.URL{Scheme: "http", Host: "proxy.example.com"}
+	awsRegion := "us-east-1"
+	for _, tt := range []struct {
+		name                string
+		gitURL              string
+		getAccessCredential bool
+		accessCredential    auth.Credential
+		expectedUsername    string
+		err                 string
+	}{
+		{
+			name:                "valid CodeCommit URL",
+			gitURL:              "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo",
+			getAccessCredential: true,
+			expectedUsername:    "access-key-id%session-token",
+		},
+		{
+			name:                "valid CodeCommit FIPS URL",
+			gitURL:              "https://git-codecommit-fips.us-east-1.amazonaws.com/v1/repos/test-repo",
+			getAccessCredential: true,
+			expectedUsername:    "access-key-id%session-token",
+		},
+		{
+			name:                "valid CodeCommit China URL",
+			gitURL:              "https://git-codecommit.cn-north-1.amazonaws.com.cn/v1/repos/test-repo",
+			getAccessCredential: true,
+			expectedUsername:    "access-key-id%session-token",
+		},
+		{
+			name:                "invalid access credential type",
+			gitURL:              "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/test-repo",
+			getAccessCredential: false,
+			accessCredential:    invalidCredential,
+			err:                 "failed to cast credential to AWS credential: *auth.RESTConfig",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			impl := &mockImplementation{
+				t:           t,
+				argRegion:   awsRegion,
+				argProxyURL: &proxyUrl,
+				returnCreds: awssdk.Credentials{AccessKeyID: "access-key-id", SecretAccessKey: "secret-access-key", SessionToken: "session-token"},
+			}
+
+			provider := aws.Provider{Implementation: impl}
+			accessCredential := tt.accessCredential
+			if tt.getAccessCredential {
+				var err error
+				accessCredential, err = auth.NewAccessCredential(t.Context(), provider,
+					auth.WithAWSRegion(awsRegion),
+					auth.WithProxyURL(proxyUrl),
+				)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+
+			creds, err := provider.NewGitCredentials(t.Context(), tt.gitURL, accessCredential)
+
+			if tt.err == "" {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(creds.Username).To(Equal(tt.expectedUsername))
+				g.Expect(creds.Password).To(MatchRegexp(`^[0-9]{8}T[0-9]{6}Z[0-9a-f]{64}$`))
+			} else {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(Equal(tt.err))
+				g.Expect(creds).To(BeNil())
+			}
+		})
+	}
+}

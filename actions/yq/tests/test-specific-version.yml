@@ -1,0 +1,28 @@
+name: Test specific version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v4.44.3
+      - name: Assert yq installed with requested version
+        run: |
+          which yq
+          OUT="$(yq --version)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "4.44.3"; then
+            echo "FAIL: expected version 4.44.3"
+            exit 1
+          fi
+          VAL="$(echo 'a: 42' | yq '.a')"
+          echo "eval: $VAL"
+          if [ "$VAL" != "42" ]; then
+            echo "FAIL: yq did not evaluate expression correctly"
+            exit 1
+          fi
+          echo "PASS"

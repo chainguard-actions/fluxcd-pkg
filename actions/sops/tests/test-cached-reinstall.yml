@@ -1,0 +1,40 @@
+name: Test cached reinstall
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: first
+        uses: .
+        with:
+          version: v3.9.0
+      - name: Record first install mtime
+        run: |
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          [ "$ARCH" = "x64" ] && ARCH=amd64
+          F="${RUNNER_TOOL_CACHE}/sops/v3.9.0/linux/${ARCH}/sops"
+          [ -x "$F" ] || { echo "FAIL: $F missing"; exit 1; }
+          stat -c %Y "$F" > /tmp/sops-mtime
+          cat /tmp/sops-mtime
+      - id: second
+        uses: .
+        with:
+          version: v3.9.0
+      - name: Assert binary reused and works
+        run: |
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          [ "$ARCH" = "x64" ] && ARCH=amd64
+          F="${RUNNER_TOOL_CACHE}/sops/v3.9.0/linux/${ARCH}/sops"
+          BEFORE=$(cat /tmp/sops-mtime)
+          AFTER=$(stat -c %Y "$F")
+          echo "before: $BEFORE after: $AFTER"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "FAIL: binary was re-downloaded"
+            exit 1
+          fi
+          OUT="$(sops --version 2>&1 || true)"
+          echo "actual: $OUT"
+          echo "$OUT" | grep -q "3.9.0" || { echo "FAIL: wrong version"; exit 1; }
+          echo "PASS"

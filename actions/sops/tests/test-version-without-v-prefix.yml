@@ -1,0 +1,27 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 3.8.1
+      - name: Assert sops version
+        run: |
+          OUT="$(sops --version 2>&1 || true)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "3.8.1"; then
+            echo "FAIL: expected version 3.8.1"
+            exit 1
+          fi
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          [ "$ARCH" = "x64" ] && ARCH=amd64
+          if [ ! -x "${RUNNER_TOOL_CACHE}/sops/v3.8.1/linux/${ARCH}/sops" ]; then
+            echo "FAIL: expected normalized v3.8.1 tool cache dir"
+            exit 1
+          fi
+          echo "PASS"
