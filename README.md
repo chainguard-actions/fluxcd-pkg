@@ -9,8 +9,8 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | Version | Tag | Upstream commit | Hardening report |
 |---------|-----|-----------------|------------------|
 | version/v0.17.0 | [`version/v0.17.0`](https://github.com/chainguard-actions/fluxcd-pkg/tree/version/v0.17.0) | — | — |
-| version/v0.19.0 | [`version/v0.19.0`](https://github.com/chainguard-actions/fluxcd-pkg/tree/version/v0.19.0) | [`e627460`](https://github.com/fluxcd/pkg/commit/e6274605262c50bf99f3d2277c8ec251c96b5edb) | — |
-| version/v0.20.0 | [`version/v0.20.0`](https://github.com/chainguard-actions/fluxcd-pkg/tree/version/v0.20.0) | — | — |
+| version/v0.19.0 | [`version/v0.19.0`](https://github.com/chainguard-actions/fluxcd-pkg/tree/version/v0.19.0) | — | — |
+| version/v0.20.0 | [`version/v0.20.0`](https://github.com/chainguard-actions/fluxcd-pkg/tree/version/v0.20.0) | [`4bf3ea9`](https://github.com/fluxcd/pkg/commit/4bf3ea935541baf8b254aa52aeff62335b563113) | — |
 
 ## Privacy
 
