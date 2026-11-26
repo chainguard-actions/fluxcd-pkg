@@ -1,0 +1,48 @@
+name: Test basic single CRD
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          crd: tests/fixtures/crd-widget.yaml
+          output: schema-out-basic
+      - name: Assert schema files generated
+        run: |
+          OUT="$GITHUB_WORKSPACE/schema-out-basic"
+          ls -la "$OUT" || { echo "FAIL: output dir missing"; exit 1; }
+          for f in widget-example-v1.json _definitions.json all.json; do
+            if [ ! -s "$OUT/$f" ]; then
+              echo "FAIL: expected $f in output"
+              exit 1
+            fi
+          done
+          echo "PASS: files exist"
+      - name: Assert schema content
+        run: |
+          OUT="$GITHUB_WORKSPACE/schema-out-basic"
+          python3 - "$OUT" <<'EOF'
+          import json, sys, os
+          out = sys.argv[1]
+          s = json.load(open(os.path.join(out, "widget-example-v1.json")))
+          print(json.dumps(s, indent=2))
+          assert s["type"] == "object", "type not object"
+          spec = s["properties"]["spec"]
+          assert spec["additionalProperties"] is False, "spec additionalProperties not False"
+          assert spec["properties"]["size"]["type"] == "integer"
+          port = spec["properties"]["port"]
+          assert port == {"oneOf": [{"type": "string"}, {"type": "integer"}]}, f"int-or-string not replaced: {port}"
+          d = json.load(open(os.path.join(out, "_definitions.json")))
+          key = "example.com.v1.Widget"
+          assert key in d["definitions"], f"missing {key}"
+          dd = d["definitions"][key]
+          assert dd["properties"]["apiVersion"]["enum"] == ["example.com/v1"]
+          assert dd["properties"]["kind"]["enum"] == ["Widget"]
+          a = json.load(open(os.path.join(out, "all.json")))
+          assert a == {"oneOf": [{"$ref": "_definitions.json#/definitions/example.com.v1.Widget"}]}, a
+          print("PASS: content valid")
+          EOF

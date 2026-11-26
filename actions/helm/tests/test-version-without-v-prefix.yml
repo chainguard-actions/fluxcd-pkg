@@ -1,0 +1,37 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # The upstream get-helm-3 installer verifies `helm` is on PATH after
+      # installing. Hosted runners ship a preinstalled helm; the act image does
+      # not, so pre-add the expected tool dir to PATH.
+      - name: Pre-add expected tool dir to PATH
+        run: |
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          echo "${RUNNER_TOOL_CACHE}/helm/v3.13.3/${OS}/${ARCH}" >> "$GITHUB_PATH"
+      - id: action
+        uses: .
+        with:
+          version: 3.13.3
+      - name: Assert helm installed and v prefix normalized
+        run: |
+          ACTUAL="$(helm version --template '{{.Version}}')"
+          echo "actual: $ACTUAL"
+          if [ "$ACTUAL" != "v3.13.3" ]; then
+            echo "FAIL: expected v3.13.3"
+            exit 1
+          fi
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          DIR="${RUNNER_TOOL_CACHE}/helm/v3.13.3/${OS}/${ARCH}"
+          echo "expected dir: $DIR"
+          if [ ! -x "$DIR/helm" ]; then
+            echo "FAIL: helm not found in normalized tool dir"
+            exit 1
+          fi
+          echo "PASS"

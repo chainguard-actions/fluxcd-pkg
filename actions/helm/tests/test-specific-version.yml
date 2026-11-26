@@ -1,0 +1,27 @@
+name: Test specific version with v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v3.14.0
+      - name: Assert helm installed with requested version
+        run: |
+          set -e
+          which helm
+          ACTUAL="$(helm version --template '{{.Version}}')"
+          echo "actual: $ACTUAL"
+          if [ "$ACTUAL" != "v3.14.0" ]; then
+            echo "FAIL: expected v3.14.0"
+            exit 1
+          fi
+          case "$(which helm)" in
+            *"/helm/v3.14.0/"*) echo "PASS: helm in tool cache dir" ;;
+            *) echo "FAIL: helm not from tool cache dir"; exit 1 ;;
+          esac
+          echo "PASS"

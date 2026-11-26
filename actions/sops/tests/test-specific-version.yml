@@ -1,0 +1,31 @@
+name: Test specific version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 3.8.1
+      - name: Assert sops 3.8.1 installed into tool cache
+        run: |
+          SOPS_PATH="$(command -v sops || true)"
+          echo "sops path: $SOPS_PATH"
+          if [ -z "$SOPS_PATH" ]; then
+            echo "FAIL: sops not on PATH"
+            exit 1
+          fi
+          case "$SOPS_PATH" in
+            *"/sops/v3.8.1/"*) ;;
+            *) echo "FAIL: sops not from tool cache dir for v3.8.1"; exit 1 ;;
+          esac
+          OUT="$(sops --version --disable-version-check 2>&1 || sops --version 2>&1)"
+          echo "version output: $OUT"
+          if ! echo "$OUT" | grep -q "3.8.1"; then
+            echo "FAIL: expected version 3.8.1"
+            exit 1
+          fi
+          echo "PASS"

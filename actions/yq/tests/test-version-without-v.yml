@@ -1,0 +1,43 @@
+name: Test install specific version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 4.44.3
+      - name: Assert yq version installed
+        run: |
+          echo "yq path: $(command -v yq)"
+          OUT="$(yq --version)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "v4.44.3"; then
+            echo "FAIL: expected yq v4.44.3"
+            exit 1
+          fi
+          echo "PASS"
+      - name: Assert installed into tool cache
+        run: |
+          BIN="$RUNNER_TOOL_CACHE/yq/v4.44.3/linux/amd64/yq"
+          if [ "$(uname -m)" = "aarch64" ]; then
+            BIN="$RUNNER_TOOL_CACHE/yq/v4.44.3/linux/arm64/yq"
+          fi
+          echo "expected binary: $BIN"
+          if [ ! -x "$BIN" ]; then
+            echo "FAIL: binary not found in tool cache"
+            exit 1
+          fi
+          case "$(command -v yq)" in
+            "$RUNNER_TOOL_CACHE"/yq/v4.44.3/*) echo "PASS: yq resolved from tool cache" ;;
+            *) echo "FAIL: yq on PATH is $(command -v yq)"; exit 1 ;;
+          esac
+      - name: Assert yq works
+        run: |
+          R="$(echo 'a: {b: hello}' | yq '.a.b')"
+          echo "actual: $R"
+          [ "$R" = "hello" ] || { echo "FAIL"; exit 1; }
+          echo "PASS"

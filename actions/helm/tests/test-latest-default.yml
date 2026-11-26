@@ -1,0 +1,40 @@
+name: Test latest version (default)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # The get-helm-3 installer requires `helm` on PATH after install; the act
+      # image has no preinstalled helm, so resolve the latest version the same
+      # way the action does and pre-add the expected tool dir to PATH.
+      - name: Pre-add expected tool dir to PATH
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          LATEST=$(curl -fsSL -H "Authorization: token ${TOKEN}" https://api.github.com/repos/helm/helm/releases/latest | grep tag_name | cut -d '"' -f 4)
+          echo "latest: $LATEST"
+          if [ -z "$LATEST" ]; then
+            echo "FAIL: could not resolve latest helm release"
+            exit 1
+          fi
+          case "$LATEST" in v*) ;; *) LATEST="v${LATEST}" ;; esac
+          echo "LATEST=$LATEST" >> "$GITHUB_ENV"
+          OS=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          echo "${RUNNER_TOOL_CACHE}/helm/${LATEST}/${OS}/${ARCH}" >> "$GITHUB_PATH"
+      - id: action
+        uses: .
+      - name: Assert helm installed
+        run: |
+          ACTUAL="$(helm version --template '{{.Version}}')"
+          echo "actual: $ACTUAL (latest: $LATEST)"
+          if ! echo "$ACTUAL" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "FAIL: expected a semver version"
+            exit 1
+          fi
+          case "$(which helm)" in
+            *"/helm/v"*) echo "PASS: helm from tool cache" ;;
+            *) echo "FAIL: helm not from tool cache: $(which helm)"; exit 1 ;;
+          esac

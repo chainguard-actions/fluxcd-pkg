@@ -1,0 +1,281 @@
+/*
+Copyright 2025 The Flux authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package auth_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"testing"
+	"time"
+
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/golang-jwt/jwt/v5"
+	. "github.com/onsi/gomega"
+
+	"github.com/fluxcd/pkg/auth"
+	"github.com/fluxcd/pkg/auth/kubernetes"
+)
+
+type mockProvider struct {
+	t *testing.T
+
+	returnName                 string
+	returnIdentity             string
+	returnIdentityErr          string
+	returnRegistryErr          string
+	returnRegistryInput        string
+	returnGitErr               string
+	returnGitInput             string
+	returnGitOptions           []auth.Option
+	returnGitCredentials       *auth.GitCredentials
+	returnRESTConfig           *auth.RESTConfig
+	returnRESTConfigOptsErr    string
+	returnControllerCredential auth.Credential
+	returnAccessCredential     auth.Credential
+	returnRegistryOptions      []auth.Option
+	returnRegistryToken        *auth.ArtifactRegistryCredentials
+	paramAudiences             []string
+	paramServiceAccount        *kubernetes.ServiceAccountReference
+	paramOIDCTokenClient       *http.Client
+	paramOIDCToken             string
+	paramOIDCTokenExpiry       time.Duration
+	paramCredentialProvider    string
+	paramArtifactRepository    string
+	paramGitURL                *url.URL
+	paramCluster               string
+	paramClusterAddress        string
+	paramAccessCredential      auth.Credential
+	paramAccessCredentials     []auth.Credential
+	paramAllowShellOut         bool
+	skipOIDCValidation         bool
+
+	// For multi-token flow (RESTConfig)
+	paramFirstScopes   []string
+	paramSecondScopes  []string
+	expectFirstScopes  bool
+	expectSecondScopes bool
+}
+
+func (m *mockProvider) GetName() string {
+	return m.returnName
+}
+
+func (m *mockProvider) NewControllerToken(ctx context.Context, opts ...auth.Option) (auth.Credential, error) {
+	m.checkOptions(opts...)
+	return m.returnControllerCredential, nil
+}
+
+func (m *mockProvider) GetAudiences(ctx context.Context, opts ...auth.Option) ([]string, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	var o auth.Options
+	o.Apply(opts...)
+	g.Expect(o.ServiceAccountRef()).To(Equal(m.paramServiceAccount))
+	if len(o.CredentialAudiences) > 0 {
+		return o.CredentialAudiences, nil
+	}
+	return []string{"mock-audience"}, nil
+}
+
+func (m *mockProvider) GetIdentity(opts ...auth.Option) (string, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	var o auth.Options
+	o.Apply(opts...)
+	g.Expect(o.ServiceAccountRef()).To(Equal(m.paramServiceAccount))
+	if m.returnIdentityErr != "" {
+		return "", errors.New(m.returnIdentityErr)
+	}
+	return m.returnIdentity, nil
+}
+
+func (m *mockProvider) NewAccessCredentialForIdentity(ctx context.Context, identity auth.Credential,
+	opts ...auth.Option) (auth.Credential, error) {
+
+	m.t.Helper()
+	g := NewWithT(m.t)
+
+	jwtCredential, ok := identity.(*auth.JWTCredential)
+	if !ok {
+		return nil, fmt.Errorf("expected *auth.JWTCredential, got %T", identity)
+	}
+	oidcToken := jwtCredential.Token
+
+	if m.paramCredentialProvider != "" {
+		g.Expect(jwtCredential.Provider).To(Equal(m.paramCredentialProvider))
+	}
+	if m.paramOIDCToken != "" {
+		g.Expect(oidcToken).To(Equal(m.paramOIDCToken))
+	}
+
+	// Verify the OIDC credential.
+	if !m.skipOIDCValidation {
+		token, _, err := jwt.NewParser().ParseUnverified(oidcToken, jwt.MapClaims{})
+		g.Expect(err).NotTo(HaveOccurred())
+		iss, err := token.Claims.GetIssuer()
+		g.Expect(err).NotTo(HaveOccurred())
+		ctx = oidc.ClientContext(ctx, m.paramOIDCTokenClient)
+		jwks := oidc.NewRemoteKeySet(ctx, iss+"openid/v1/jwks")
+		clientIDs := m.paramAudiences
+		if len(clientIDs) == 0 {
+			clientIDs = []string{"mock-audience"}
+		}
+		for _, aud := range clientIDs {
+			_, err = oidc.NewVerifier(iss, jwks, &oidc.Config{
+				ClientID:             aud,
+				SupportedSigningAlgs: []string{token.Method.Alg()},
+			}).Verify(ctx, oidcToken)
+			g.Expect(err).NotTo(HaveOccurred())
+		}
+
+		// Verify the OIDC token expiration, when an expiration is expected.
+		if m.paramOIDCTokenExpiry > 0 {
+			exp, err := token.Claims.GetExpirationTime()
+			g.Expect(err).NotTo(HaveOccurred())
+			iat, err := token.Claims.GetIssuedAt()
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(exp.Sub(iat.Time)).To(BeNumerically("~", m.paramOIDCTokenExpiry, time.Minute))
+		}
+	}
+
+	var o auth.Options
+	o.Apply(opts...)
+	g.Expect(o.ServiceAccountRef()).To(Equal(m.paramServiceAccount))
+
+	m.checkOptions(opts...)
+
+	return m.returnAccessCredential, nil
+}
+
+func (m *mockProvider) ParseArtifactRepository(artifactRepository string) (string, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	g.Expect(artifactRepository).To(Equal(m.paramArtifactRepository))
+	if m.returnRegistryErr != "" {
+		return "", errors.New(m.returnRegistryErr)
+	}
+	return m.returnRegistryInput, nil
+}
+
+func (m *mockProvider) GetAccessCredentialOptionsForArtifactRepository(artifactRepository string,
+	_ ...auth.Option) ([]auth.Option, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	g.Expect(artifactRepository).To(Equal(m.paramArtifactRepository))
+	return m.returnRegistryOptions, nil
+}
+
+func (m *mockProvider) NewArtifactRegistryCredentials(ctx context.Context, registryInput string,
+	accessCredential auth.Credential, opts ...auth.Option) (*auth.ArtifactRegistryCredentials, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	g.Expect(registryInput).To(Equal(m.paramArtifactRepository))
+	g.Expect(accessCredential).To(Equal(m.paramAccessCredential))
+	m.checkOptions(opts...)
+	return m.returnRegistryToken, nil
+}
+
+func (m *mockProvider) ParseGitRepository(gitURL *url.URL) (string, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	g.Expect(gitURL).To(Equal(m.paramGitURL))
+	if m.returnGitErr != "" {
+		return "", errors.New(m.returnGitErr)
+	}
+	return m.returnGitInput, nil
+}
+
+func (m *mockProvider) GetAccessCredentialOptionsForGitRepository(gitURL *url.URL) ([]auth.Option, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	g.Expect(gitURL).To(Equal(m.paramGitURL))
+	return m.returnGitOptions, nil
+}
+
+func (m *mockProvider) NewGitCredentials(ctx context.Context, gitInput string,
+	accessCredential auth.Credential, opts ...auth.Option) (*auth.GitCredentials, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	g.Expect(gitInput).To(Equal(m.returnGitInput))
+	g.Expect(accessCredential).To(Equal(m.paramAccessCredential))
+	m.checkOptions(opts...)
+	return m.returnGitCredentials, nil
+}
+
+func (m *mockProvider) GetAccessCredentialOptionsForCluster(opts ...auth.Option) ([][]auth.Option, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	var o auth.Options
+	o.Apply(opts...)
+	g.Expect(o.ClusterResource).To(Equal(m.paramCluster))
+	if m.returnRESTConfigOptsErr != "" {
+		return nil, errors.New(m.returnRESTConfigOptsErr)
+	}
+	return [][]auth.Option{{auth.WithScopes("first-token")}, {auth.WithScopes("second-token")}}, nil
+}
+
+func (m *mockProvider) NewRESTConfig(ctx context.Context, accessCredentials []auth.Credential,
+	opts ...auth.Option) (*auth.RESTConfig, error) {
+	m.t.Helper()
+	g := NewWithT(m.t)
+	var o auth.Options
+	o.Apply(opts...)
+	g.Expect(o.ClusterResource).To(Equal(m.paramCluster))
+	g.Expect(o.ClusterAddress).To(Equal(m.paramClusterAddress))
+	g.Expect(accessCredentials).To(Equal(m.paramAccessCredentials))
+	m.checkOptions(opts...)
+	return m.returnRESTConfig, nil
+}
+
+func (m *mockProvider) checkOptions(opts ...auth.Option) {
+	m.t.Helper()
+
+	g := NewWithT(m.t)
+
+	var o auth.Options
+	o.Apply(opts...)
+
+	// Determine which scopes to expect based on multi-token flow
+	expectedScopes := []string{"scope1", "scope2"}
+	if m.paramFirstScopes != nil && m.paramSecondScopes != nil {
+		switch {
+		case m.expectFirstScopes:
+			expectedScopes = m.paramFirstScopes
+			m.expectFirstScopes = false
+		case m.expectSecondScopes:
+			expectedScopes = m.paramSecondScopes
+			m.expectSecondScopes = false
+		default:
+			expectedScopes = []string{"scope1", "scope2"}
+		}
+	}
+
+	expectedAudiences := []string{"audience1", "audience2"}
+	if m.paramAudiences != nil {
+		expectedAudiences = m.paramAudiences
+	}
+	g.Expect(o.CredentialAudiences).To(ConsistOf(expectedAudiences))
+	g.Expect(o.Scopes).To(Equal(expectedScopes))
+	g.Expect(o.AWSRegion).To(Equal("us-east-1"))
+	g.Expect(o.AWSSTSEndpoint).To(Equal("https://sts.some-cloud.io"))
+	g.Expect(o.ProxyURL).To(Equal(&url.URL{Scheme: "http", Host: "proxy.io:8080"}))
+	g.Expect(o.CAData).To(Equal("ca-data"))
+	g.Expect(o.AllowShellOut).To(Equal(m.paramAllowShellOut))
+}

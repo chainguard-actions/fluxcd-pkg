@@ -1,0 +1,25 @@
+name: Test explicit version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: "5.4.1"
+      - name: Assert kustomize 5.4.1 installed
+        run: |
+          ACTUAL="$(kustomize version)"
+          echo "actual: $ACTUAL"
+          if ! echo "$ACTUAL" | grep -q "5.4.1"; then
+            echo "FAIL: expected version 5.4.1"
+            exit 1
+          fi
+          if [ ! -x "$RUNNER_TOOL_CACHE/kustomize/v5.4.1/linux/$(echo "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]' | sed 's/^x64$/amd64/')/kustomize" ]; then
+            echo "FAIL: binary not found in tool cache"
+            exit 1
+          fi
+          echo "PASS"

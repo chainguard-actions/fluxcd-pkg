@@ -1,0 +1,45 @@
+name: Test specific k8s and envtest versions
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          k8s_version: "1.30.x"
+          envtest_version: release-0.19
+      - name: Assert setup-envtest installed in versioned tool dir
+        run: |
+          P="$(command -v setup-envtest || true)"
+          echo "setup-envtest: $P"
+          if [ -z "$P" ]; then
+            echo "FAIL: setup-envtest not on PATH"
+            exit 1
+          fi
+          case "$P" in
+            *setup-envtest/release-0.19/*) echo "PASS" ;;
+            *) echo "FAIL: expected path under setup-envtest/release-0.19/"; exit 1 ;;
+          esac
+      - name: Assert KUBEBUILDER_ASSETS points at 1.30 binaries
+        run: |
+          echo "KUBEBUILDER_ASSETS raw: $KUBEBUILDER_ASSETS"
+          ASSETS="${KUBEBUILDER_ASSETS//\'/}"
+          case "$ASSETS" in
+            *1.30.*) ;;
+            *) echo "FAIL: expected 1.30.x in assets path"; exit 1 ;;
+          esac
+          if [ ! -x "$ASSETS/kube-apiserver" ]; then
+            echo "FAIL: kube-apiserver missing"
+            ls -la "$ASSETS" || true
+            exit 1
+          fi
+          VER="$("$ASSETS/kube-apiserver" --version)"
+          echo "kube-apiserver version: $VER"
+          if ! echo "$VER" | grep -q 'v1\.30\.'; then
+            echo "FAIL: expected v1.30.x"
+            exit 1
+          fi
+          echo "PASS"

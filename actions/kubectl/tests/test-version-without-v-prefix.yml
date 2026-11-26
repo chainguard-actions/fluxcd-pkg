@@ -1,0 +1,27 @@
+name: Test version without v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: 1.29.3
+      - name: Assert kubectl v1.29.3 installed
+        run: |
+          OUT="$(kubectl version --client -o json)"
+          echo "$OUT"
+          if ! echo "$OUT" | grep -q '"gitVersion": *"v1.29.3"'; then
+            echo "FAIL: expected gitVersion v1.29.3"
+            exit 1
+          fi
+          if [ ! -x "$RUNNER_TOOL_CACHE/kubectl/v1.29.3/linux/amd64/kubectl" ] && \
+             [ ! -x "$RUNNER_TOOL_CACHE/kubectl/v1.29.3/linux/arm64/kubectl" ]; then
+            echo "FAIL: binary not found under v-prefixed tool cache dir"
+            ls -R "$RUNNER_TOOL_CACHE/kubectl" || true
+            exit 1
+          fi
+          echo "PASS"

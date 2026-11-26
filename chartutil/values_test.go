@@ -1,0 +1,820 @@
+/*
+Copyright 2024 The Flux authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package chartutil
+
+import (
+	"context"
+	"testing"
+
+	"github.com/go-logr/logr"
+	. "github.com/onsi/gomega"
+	"helm.sh/helm/v4/pkg/chart/common"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/fluxcd/pkg/apis/meta"
+)
+
+func TestChartValuesFromReferences(t *testing.T) {
+	scheme := testScheme()
+
+	tests := []struct {
+		name       string
+		resources  []runtime.Object
+		namespace  string
+		references []meta.ValuesReference
+		values     string
+		want       common.Values
+		wantErr    bool
+	}{
+		{
+			name: "merges",
+			resources: []runtime.Object{
+				mockConfigMap("values", map[string]string{
+					"values.yaml": `flat: value
+nested:
+  configuration: value
+`,
+				}),
+				mockSecret("values", map[string][]byte{
+					"values.yaml": []byte(`flat:
+  nested: value
+nested: value
+`),
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind: kindConfigMap,
+					Name: "values",
+				},
+				{
+					Kind: kindSecret,
+					Name: "values",
+				},
+			},
+			values: `
+other: values
+`,
+			want: common.Values{
+				"flat": map[string]any{
+					"nested": "value",
+				},
+				"nested": "value",
+				"other":  "values",
+			},
+		},
+		{
+			name: "with target path",
+			resources: []runtime.Object{
+				mockSecret("values", map[string][]byte{"single": []byte("value")}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					ValuesKey:  "single",
+					TargetPath: "merge.at.specific.path",
+				},
+			},
+			want: common.Values{
+				"merge": map[string]any{
+					"at": map[string]any{
+						"specific": map[string]any{
+							"path": "value",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "target path precedence over all",
+			resources: []runtime.Object{
+				mockConfigMap("values", map[string]string{
+					"values.yaml": `flat: value
+nested:
+  configuration:
+  - one
+  - two
+  - three
+`,
+				}),
+				mockSecret("values", map[string][]byte{"key": []byte("value")}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					ValuesKey:  "key",
+					TargetPath: "nested.configuration[0]",
+				},
+				{
+					Kind: kindConfigMap,
+					Name: "values",
+				},
+			},
+
+			values: `
+nested:
+  configuration:
+  - list
+  - item
+  - option
+`,
+			want: common.Values{
+				"flat": "value",
+				"nested": map[string]any{
+					"configuration": []any{"value", "item", "option"},
+				},
+			},
+		},
+		{
+			name: "target path for string type array item",
+			resources: []runtime.Object{
+				mockConfigMap("values", map[string]string{
+					"values.yaml": `flat: value
+nested:
+  configuration:
+  - list
+  - item
+  - option
+`,
+				}),
+				mockSecret("values", map[string][]byte{
+					"values.yaml": []byte(`foo`),
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind: kindConfigMap,
+					Name: "values",
+				},
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					TargetPath: "nested.configuration[1]",
+				},
+			},
+			values: `
+other: values
+`,
+			want: common.Values{
+				"flat": "value",
+				"nested": map[string]any{
+					"configuration": []any{"list", "foo", "option"},
+				},
+				"other": "values",
+			},
+		},
+		{
+			name: "every target path takes precedence over values",
+			resources: []runtime.Object{
+				mockSecret("values", map[string][]byte{"token": []byte("real")}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					ValuesKey:  "token",
+					TargetPath: "config.a.token",
+				},
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					ValuesKey:  "token",
+					TargetPath: "config.b.token",
+				},
+			},
+			values: `
+config:
+  a:
+    token: placeholder
+  b:
+    token: placeholder
+`,
+			want: common.Values{
+				"config": map[string]any{
+					"a": map[string]any{"token": "real"},
+					"b": map[string]any{"token": "real"},
+				},
+			},
+		},
+		{
+			name: "top level target path takes precedence over values",
+			resources: []runtime.Object{
+				mockSecret("values", map[string][]byte{"token": []byte("real")}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					ValuesKey:  "token",
+					TargetPath: "token",
+				},
+			},
+			values: `
+token: placeholder
+`,
+			want: common.Values{
+				"token": "real",
+			},
+		},
+		{
+			name: "later target path wins over earlier target path",
+			resources: []runtime.Object{
+				mockSecret("values", map[string][]byte{
+					"first":  []byte("one"),
+					"second": []byte("two"),
+				}),
+				mockConfigMap("values", map[string]string{
+					"values.yaml": "config:\n  token: configmap\n",
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					ValuesKey:  "first",
+					TargetPath: "config.token",
+				},
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					ValuesKey:  "second",
+					TargetPath: "config.token",
+				},
+				{
+					Kind: kindConfigMap,
+					Name: "values",
+				},
+			},
+			want: common.Values{
+				"config": map[string]any{"token": "two"},
+			},
+		},
+		{
+			name: "values reference to non existing secret",
+			references: []meta.ValuesReference{
+				{
+					Kind: kindSecret,
+					Name: "missing",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "optional values reference to non existing secret",
+			references: []meta.ValuesReference{
+				{
+					Kind:     kindSecret,
+					Name:     "missing",
+					Optional: true,
+				},
+			},
+			want:    common.Values{},
+			wantErr: false,
+		},
+		{
+			name: "values reference to non existing config map",
+			references: []meta.ValuesReference{
+				{
+					Kind: kindConfigMap,
+					Name: "missing",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "optional values reference to non existing config map",
+			references: []meta.ValuesReference{
+				{
+					Kind:     kindConfigMap,
+					Name:     "missing",
+					Optional: true,
+				},
+			},
+			want:    common.Values{},
+			wantErr: false,
+		},
+		{
+			name: "missing secret key",
+			resources: []runtime.Object{
+				mockSecret("values", nil),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:      kindSecret,
+					Name:      "values",
+					ValuesKey: "nonexisting",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing config map key",
+			resources: []runtime.Object{
+				mockConfigMap("values", nil),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:      kindConfigMap,
+					Name:      "values",
+					ValuesKey: "nonexisting",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unsupported values reference kind",
+			references: []meta.ValuesReference{
+				{
+					Kind: "Unsupported",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid values",
+			resources: []runtime.Object{
+				mockConfigMap("values", map[string]string{
+					"values.yaml": `
+invalid`,
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind: kindConfigMap,
+					Name: "values",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			// Documents the bug that Literal exists to work around: a value
+			// containing helm-set metacharacters (here: a comma inside a YAML
+			// flow sequence) is interpreted by strvals.ParseInto and corrupts
+			// the merged value. Same input passes through cleanly in the
+			// "literal mode" test cases below.
+			name: "non-literal target path mangles value with commas",
+			resources: []runtime.Object{
+				mockConfigMap("values", map[string]string{
+					"application.yml": `endpoints: [a,b,c]`,
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindConfigMap,
+					Name:       "values",
+					ValuesKey:  "application.yml",
+					TargetPath: `externalConfig.application\.yml.content`,
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "literal target path preserves helm-set metacharacters",
+			resources: []runtime.Object{
+				mockConfigMap("values", map[string]string{
+					"application.yml": "server:\n  port: 8080\nmanagement:\n  endpoints:\n    web:\n      exposure:\n        include: [ \"prometheus\", \"health\" ]\n",
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindConfigMap,
+					Name:       "values",
+					ValuesKey:  "application.yml",
+					TargetPath: `externalConfig.application\.yml.content`,
+					Literal:    true,
+				},
+			},
+			want: common.Values{
+				"externalConfig": map[string]any{
+					"application.yml": map[string]any{
+						"content": "server:\n  port: 8080\nmanagement:\n  endpoints:\n    web:\n      exposure:\n        include: [ \"prometheus\", \"health\" ]\n",
+					},
+				},
+			},
+		},
+		{
+			name: "literal target path preserves multi-line HOCON with equals and braces",
+			resources: []runtime.Object{
+				mockSecret("values", map[string][]byte{
+					"application.conf": []byte("kafka {\n  bootstrap = \"b-1:9098,b-2:9098\"\n  group = \"my.service\"\n}\n"),
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindSecret,
+					Name:       "values",
+					ValuesKey:  "application.conf",
+					TargetPath: `externalConfig.application\.conf.content`,
+					Literal:    true,
+				},
+			},
+			want: common.Values{
+				"externalConfig": map[string]any{
+					"application.conf": map[string]any{
+						"content": "kafka {\n  bootstrap = \"b-1:9098,b-2:9098\"\n  group = \"my.service\"\n}\n",
+					},
+				},
+			},
+		},
+		{
+			name: "literal flag without targetPath is ignored (root YAML merge)",
+			resources: []runtime.Object{
+				mockConfigMap("values", map[string]string{
+					"values.yaml": "flat: value\n",
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:    kindConfigMap,
+					Name:    "values",
+					Literal: true,
+				},
+			},
+			want: common.Values{
+				"flat": "value",
+			},
+		},
+		{
+			// Regression test for fluxcd/flux2#2625: a Secret carrying a
+			// comma-separated list of Kafka brokers fails to merge via
+			// targetPath because strvals interprets the commas as list
+			// separators and the colons inside `host:port` as key/value
+			// dividers, yielding `key "net:9092" has no value (cannot
+			// end with ,)`. Pinned here to document the bug that Literal
+			// mode resolves.
+			name: "flux2#2625 non-literal: comma-separated brokers fail to merge",
+			resources: []runtime.Object{
+				mockSecret("kafka", map[string][]byte{
+					"brokers": []byte("kafka01.net:9092,kafka02.net:9092,kafka03.net:9092"),
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindSecret,
+					Name:       "kafka",
+					ValuesKey:  "brokers",
+					TargetPath: "kafka.brokers",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			// fluxcd/flux2#2625 resolved: with Literal: true the same
+			// comma-separated broker list is preserved verbatim at the
+			// target path.
+			name: "flux2#2625 literal: comma-separated brokers preserved verbatim",
+			resources: []runtime.Object{
+				mockSecret("kafka", map[string][]byte{
+					"brokers": []byte("kafka01.net:9092,kafka02.net:9092,kafka03.net:9092"),
+				}),
+			},
+			references: []meta.ValuesReference{
+				{
+					Kind:       kindSecret,
+					Name:       "kafka",
+					ValuesKey:  "brokers",
+					TargetPath: "kafka.brokers",
+					Literal:    true,
+				},
+			},
+			want: common.Values{
+				"kafka": map[string]any{
+					"brokers": "kafka01.net:9092,kafka02.net:9092,kafka03.net:9092",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(tt.resources...)
+			var values map[string]any
+			if tt.values != "" {
+				m, err := common.ReadValues([]byte(tt.values))
+				g.Expect(err).ToNot(HaveOccurred())
+				values = m
+			}
+			got, err := ChartValuesFromReferences(context.TODO(), logr.Discard(), c.Build(), tt.namespace, values, tt.references...)
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(got).To(BeNil())
+				return
+			}
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(got).To(Equal(tt.want))
+		})
+	}
+}
+
+func TestChartValuesFromReferences_DoesNotModifyValues(t *testing.T) {
+	g := NewWithT(t)
+
+	c := fake.NewClientBuilder().WithScheme(testScheme()).WithRuntimeObjects(
+		mockSecret("values", map[string][]byte{"token": []byte("real")}),
+	).Build()
+	values, err := common.ReadValues([]byte(`
+config:
+  token: placeholder
+  list:
+  - placeholder
+`))
+	g.Expect(err).ToNot(HaveOccurred())
+
+	refs := []meta.ValuesReference{
+		{Kind: kindSecret, Name: "values", ValuesKey: "token", TargetPath: "config.token"},
+		{Kind: kindSecret, Name: "values", ValuesKey: "token", TargetPath: "config.list[0]"},
+	}
+	got, err := ChartValuesFromReferences(context.TODO(), logr.Discard(), c, "", values, refs...)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(got).To(Equal(common.Values{
+		"config": map[string]any{
+			"token": "real",
+			"list":  []any{"real"},
+		},
+	}))
+	g.Expect(values).To(Equal(common.Values{
+		"config": map[string]any{
+			"token": "placeholder",
+			"list":  []any{"placeholder"},
+		},
+	}))
+}
+
+// This tests compatability with the formats described in:
+// https://helm.sh/docs/intro/using_helm/#the-format-and-limitations-of---set
+func TestReplacePathValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   []byte
+		path    string
+		want    map[string]any
+		wantErr bool
+	}{
+		{
+			name:  "outer inner",
+			value: []byte("value"),
+			path:  "outer.inner",
+			want: map[string]any{
+				"outer": map[string]any{
+					"inner": "value",
+				},
+			},
+		},
+		{
+			name:  "inline list",
+			value: []byte("{a,b,c}"),
+			path:  "name",
+			want: map[string]any{
+				// TODO(hidde): figure out why the cap is off by len+1
+				"name": append(make([]any, 0, 4), []any{"a", "b", "c"}...),
+			},
+		},
+		{
+			name:  "with escape",
+			value: []byte(`value1\,value2`),
+			path:  "name",
+			want: map[string]any{
+				"name": "value1,value2",
+			},
+		},
+		{
+			name:  "target path with boolean value",
+			value: []byte("true"),
+			path:  "merge.at.specific.path",
+			want: common.Values{
+				"merge": map[string]any{
+					"at": map[string]any{
+						"specific": map[string]any{
+							"path": true,
+						},
+					},
+				},
+			},
+		},
+		{
+			name:  "target path with set-string behavior",
+			value: []byte(`"true"`),
+			path:  "merge.at.specific.path",
+			want: common.Values{
+				"merge": map[string]any{
+					"at": map[string]any{
+						"specific": map[string]any{
+							"path": "true",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:  "target path with array item",
+			value: []byte("value"),
+			path:  "merge.at[2]",
+			want: common.Values{
+				"merge": map[string]any{
+					"at": []any{nil, nil, "value"},
+				},
+			},
+		},
+		{
+			name:  "dot sequence escaping path",
+			value: []byte("master"),
+			path:  `nodeSelector.kubernetes\.io/role`,
+			want: map[string]any{
+				"nodeSelector": map[string]any{
+					"kubernetes.io/role": "master",
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			values := map[string]any{}
+			err := ReplacePathValue(values, tt.path, string(tt.value))
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(values).To(BeNil())
+				return
+			}
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(values).To(Equal(tt.want))
+		})
+	}
+}
+
+// TestReplacePathLiteralValue covers the helm `--set-literal` equivalent:
+// the value is consumed verbatim, with metacharacters preserved.
+func TestReplacePathLiteralValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   []byte
+		path    string
+		want    map[string]any
+		wantErr bool
+	}{
+		{
+			name:  "simple string",
+			value: []byte("value"),
+			path:  "outer.inner",
+			want: map[string]any{
+				"outer": map[string]any{
+					"inner": "value",
+				},
+			},
+		},
+		{
+			name:  "value with commas is preserved",
+			value: []byte("a,b,c"),
+			path:  "name",
+			want: map[string]any{
+				"name": "a,b,c",
+			},
+		},
+		{
+			name:  "value with braces is preserved (not parsed as inline list)",
+			value: []byte("{a,b,c}"),
+			path:  "name",
+			want: map[string]any{
+				"name": "{a,b,c}",
+			},
+		},
+		{
+			name:  "value with equals signs is preserved",
+			value: []byte("foo=bar=baz"),
+			path:  "name",
+			want: map[string]any{
+				"name": "foo=bar=baz",
+			},
+		},
+		{
+			name:  "value with brackets is preserved (not parsed as array index)",
+			value: []byte("endpoints: [a, b, c]"),
+			path:  "config",
+			want: map[string]any{
+				"config": "endpoints: [a, b, c]",
+			},
+		},
+		{
+			name:  "multi-line YAML content is preserved verbatim",
+			value: []byte("server:\n  port: 8080\nmanagement:\n  endpoints:\n    web:\n      exposure:\n        include: [ \"prometheus\", \"health\" ]\n"),
+			path:  `externalConfig.application\.yml.content`,
+			want: map[string]any{
+				"externalConfig": map[string]any{
+					"application.yml": map[string]any{
+						"content": "server:\n  port: 8080\nmanagement:\n  endpoints:\n    web:\n      exposure:\n        include: [ \"prometheus\", \"health\" ]\n",
+					},
+				},
+			},
+		},
+		{
+			name:  "HOCON content with equals and quoted strings is preserved",
+			value: []byte("kafka {\n  bootstrap = \"b-1:9098,b-2:9098\"\n  group = \"svc.consumer\"\n}\n"),
+			path:  `externalConfig.application\.conf.content`,
+			want: map[string]any{
+				"externalConfig": map[string]any{
+					"application.conf": map[string]any{
+						"content": "kafka {\n  bootstrap = \"b-1:9098,b-2:9098\"\n  group = \"svc.consumer\"\n}\n",
+					},
+				},
+			},
+		},
+		{
+			name:  "JSON string is preserved verbatim (no escape needed)",
+			value: []byte(`["a","b","c"]`),
+			path:  "subnet_ids",
+			want: map[string]any{
+				"subnet_ids": `["a","b","c"]`,
+			},
+		},
+		{
+			name:  "boolean-like string stays a string",
+			value: []byte("true"),
+			path:  "feature.enabled",
+			want: map[string]any{
+				"feature": map[string]any{
+					"enabled": "true",
+				},
+			},
+		},
+		{
+			name:  "dot escape in path still works",
+			value: []byte("master"),
+			path:  `nodeSelector.kubernetes\.io/role`,
+			want: map[string]any{
+				"nodeSelector": map[string]any{
+					"kubernetes.io/role": "master",
+				},
+			},
+		},
+		{
+			// fluxcd/flux2#2625: comma-separated host:port list. Without
+			// Literal mode strvals parses this as a malformed inline list
+			// and errors with `key "net:9092" has no value`.
+			name:  "flux2#2625 kafka broker list with host:port and commas",
+			value: []byte("kafka01.net:9092,kafka02.net:9092,kafka03.net:9092"),
+			path:  "kafka.brokers",
+			want: map[string]any{
+				"kafka": map[string]any{
+					"brokers": "kafka01.net:9092,kafka02.net:9092,kafka03.net:9092",
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			values := map[string]any{}
+			err := ReplacePathLiteralValue(values, tt.path, string(tt.value))
+			if tt.wantErr {
+				g.Expect(err).To(HaveOccurred())
+				return
+			}
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(values).To(Equal(tt.want))
+		})
+	}
+}
+
+func mockSecret(name string, data map[string][]byte) *corev1.Secret {
+	return &corev1.Secret{
+		Kind:       kindSecret,
+		APIVersion: "v1",
+		Name:       name,
+		Data:       data,
+	}
+}
+
+func mockConfigMap(name string, data map[string]string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		Kind:       kindConfigMap,
+		APIVersion: "v1",
+		Name:       name,
+		Data:       data,
+	}
+}
+
+func testScheme() *runtime.Scheme {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	return scheme
+}

@@ -1,0 +1,43 @@
+name: Test multiple CRDs and versions in one file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          crd: tests/fixtures/crd-multi.yaml
+          output: schema-out-multi/nested
+      - name: Assert schema files generated
+        run: |
+          OUT="$GITHUB_WORKSPACE/schema-out-multi/nested"
+          ls -la "$OUT" || { echo "FAIL: output dir missing"; exit 1; }
+          for f in gadget-toolbox-v1beta1.json gadget-toolbox-v1.json sprocket-toolbox-v1.json _definitions.json all.json; do
+            if [ ! -s "$OUT/$f" ]; then
+              echo "FAIL: expected $f in output"
+              exit 1
+            fi
+          done
+          echo "PASS: files exist"
+      - name: Assert definitions and all.json
+        run: |
+          OUT="$GITHUB_WORKSPACE/schema-out-multi/nested"
+          python3 - "$OUT" <<'EOF'
+          import json, sys, os
+          out = sys.argv[1]
+          d = json.load(open(os.path.join(out, "_definitions.json")))["definitions"]
+          print(sorted(d.keys()))
+          expected = {"toolbox.io.v1beta1.Gadget", "toolbox.io.v1.Gadget", "toolbox.io.v1.Sprocket"}
+          assert set(d.keys()) == expected, f"unexpected keys {sorted(d.keys())}"
+          refs = json.load(open(os.path.join(out, "all.json")))["oneOf"]
+          got = {r["$ref"].split("/")[-1] for r in refs}
+          assert got == expected, f"unexpected refs {got}"
+          v1 = json.load(open(os.path.join(out, "gadget-toolbox-v1.json")))
+          assert "count" in v1["properties"]["spec"]["properties"]
+          v1b = json.load(open(os.path.join(out, "gadget-toolbox-v1beta1.json")))
+          assert "count" not in v1b["properties"]["spec"]["properties"]
+          print("PASS")
+          EOF

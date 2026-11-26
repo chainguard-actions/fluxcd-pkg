@@ -1,0 +1,35 @@
+name: Test install specific version with v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: v4.43.1
+      - name: Assert yq version installed
+        run: |
+          OUT="$(yq --version)"
+          echo "actual: $OUT"
+          if ! echo "$OUT" | grep -q "v4.43.1"; then
+            echo "FAIL: expected yq v4.43.1"
+            exit 1
+          fi
+          if [ -d "$RUNNER_TOOL_CACHE/yq/vv4.43.1" ]; then
+            echo "FAIL: version got double v prefix"
+            exit 1
+          fi
+          echo "PASS"
+      - name: Run action again (cached path)
+        uses: .
+        with:
+          version: v4.43.1
+      - name: Assert still correct after cached install
+        run: |
+          OUT="$(yq --version)"
+          echo "actual: $OUT"
+          echo "$OUT" | grep -q "v4.43.1" || { echo "FAIL"; exit 1; }
+          echo "PASS"

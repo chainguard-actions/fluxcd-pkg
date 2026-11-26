@@ -1,0 +1,25 @@
+name: Test v-prefixed version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          version: "v5.2.1"
+      - name: Assert kustomize 5.2.1 installed
+        run: |
+          ACTUAL="$(kustomize version)"
+          echo "actual: $ACTUAL"
+          if ! echo "$ACTUAL" | grep -q "5.2.1"; then
+            echo "FAIL: expected version 5.2.1"
+            exit 1
+          fi
+          if ls -d "$RUNNER_TOOL_CACHE"/kustomize/vv* 2>/dev/null; then
+            echo "FAIL: version got double v prefix"
+            exit 1
+          fi
+          echo "PASS"

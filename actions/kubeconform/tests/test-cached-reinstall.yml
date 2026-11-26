@@ -1,0 +1,37 @@
+name: Test cached reinstall
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: first
+        uses: .
+        with:
+          version: v0.6.7
+      - name: Record binary mtime
+        run: |
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          [ "$ARCH" = "x64" ] && ARCH=amd64
+          F="${RUNNER_TOOL_CACHE}/kubeconform/v0.6.7/linux/${ARCH}/kubeconform"
+          [ -x "$F" ] || { echo "FAIL: binary missing after first install"; exit 1; }
+          stat -c %Y "$F" > /tmp/mtime1
+          sleep 2
+      - id: second
+        uses: .
+        with:
+          version: v0.6.7
+      - name: Assert second run reused cached binary
+        run: |
+          ARCH=$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')
+          [ "$ARCH" = "x64" ] && ARCH=amd64
+          F="${RUNNER_TOOL_CACHE}/kubeconform/v0.6.7/linux/${ARCH}/kubeconform"
+          M1=$(cat /tmp/mtime1); M2=$(stat -c %Y "$F")
+          echo "mtime1=$M1 mtime2=$M2"
+          if [ "$M1" != "$M2" ]; then
+            echo "FAIL: binary was re-downloaded"
+            exit 1
+          fi
+          kubeconform -v | grep -q 0.6.7 || { echo "FAIL: wrong version"; exit 1; }
+          echo "PASS"
